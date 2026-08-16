@@ -13,7 +13,7 @@ Unofficial Homebridge dynamic-platform plugin for Sleepy's Elite / BOX25 adjusta
 
 ## Requirements
 
-- Homebridge 1.8+ or 2.x
+- Homebridge 2.x
 - Node.js 22 or 24
 - Linux with Bluetooth / BlueZ
 - Python 3
