@@ -28,5 +28,13 @@
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fjmpy6hm2b-cloud/homebridge-sleepys-elite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fjmpy6hm2b-cloud/homebridge-sleepys-elite/issues"
+  },
+  "homepage": "https://github.com/fjmpy6hm2b-cloud/homebridge-sleepys-elite#readme"
 }
