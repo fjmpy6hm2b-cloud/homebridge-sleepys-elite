@@ -1,0 +1,5 @@
+.venv/
+*.tgz
+*.log
+.DS_Store
+node_modules/

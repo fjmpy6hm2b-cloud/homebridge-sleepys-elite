@@ -1,0 +1,32 @@
+{
+  "name": "homebridge-sleepys-elite",
+  "displayName": "Sleepy's Elite",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Homebridge dynamic platform plugin for Sleepy's Elite / BOX25 adjustable beds",
+  "author": "Max S",
+  "license": "MIT",
+  "main": "index.js",
+  "keywords": [
+    "homebridge-plugin",
+    "supports-hap",
+    "sleepys",
+    "adjustable-bed",
+    "bluetooth"
+  ],
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0",
+    "homebridge": "^2.0.0"
+  },
+  "files": [
+    "index.js",
+    "settings.js",
+    "platform.js",
+    "platformAccessory.js",
+    "sleepy_worker.py",
+    "config.schema.json",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ]
+}
