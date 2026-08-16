@@ -8,17 +8,19 @@
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Sleepy's Elite",
-        "required": true
+        "default": "Sleepy's Elite"
       },
       "deviceNamePrefix": {
         "title": "Bed Bluetooth Name Prefix",
         "type": "string",
         "default": "Star25",
-        "required": true,
         "description": "Bluetooth advertising-name prefix used to discover the bed."
       }
-    }
+    },
+    "required": [
+      "name",
+      "deviceNamePrefix"
+    ]
   },
   "form": [
     "name",
