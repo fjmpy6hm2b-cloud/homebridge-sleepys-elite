@@ -17,19 +17,11 @@
         "default": "Star25",
         "required": true,
         "description": "Bluetooth advertising-name prefix used to discover the bed."
-      },
-      "pythonPath": {
-        "title": "Python Executable",
-        "type": "string",
-        "default": "python3",
-        "required": true,
-        "description": "Python executable with the bleak package installed."
       }
     }
   },
   "form": [
     "name",
-    "deviceNamePrefix",
-    "pythonPath"
+    "deviceNamePrefix"
   ]
 }
