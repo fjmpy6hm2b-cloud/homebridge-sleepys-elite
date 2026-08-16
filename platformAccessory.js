@@ -1,4 +1,4 @@
-import { SleepysBedController } from './bedController.js';
+import { existsSync } from 'node:fs';
 
 export class SleepysElitePlatformAccessory {
   constructor(platform, accessory) {
@@ -39,15 +39,33 @@ export class SleepysElitePlatformAccessory {
     this.createZone('Lumbar', 'lumbar');
     this.createZone('Light', 'led');
 
-    this.bed = new SleepysBedController(this.log, {
-      deviceNamePrefix: this.deviceNamePrefix,
-      onPosition: (position) => this.updatePosition(position),
-      onLightState: (on) => this.updateLightState(on),
-    });
+    this.bed = null;
+    this.initializeBluetooth();
+  }
 
-    this.bed.start().catch((error) => {
-      this.log.warn(`Initial Bluetooth connection failed: ${error.message}`);
-    });
+  async initializeBluetooth() {
+    // Verification/test environments may not expose the host BlueZ system bus.
+    // The plugin must still load cleanly when Bluetooth is unavailable.
+    if (!existsSync('/run/dbus/system_bus_socket')) {
+      this.log.debug(
+        'BlueZ system D-Bus is unavailable; Bluetooth connection will not be started.',
+      );
+      return;
+    }
+
+    try {
+      const { SleepysBedController } = await import('./bedController.js');
+
+      this.bed = new SleepysBedController(this.log, {
+        deviceNamePrefix: this.deviceNamePrefix,
+        onPosition: (position) => this.updatePosition(position),
+        onLightState: (on) => this.updateLightState(on),
+      });
+
+      await this.bed.start();
+    } catch (error) {
+      this.log.warn(`Bluetooth is unavailable: ${error.message}`);
+    }
   }
 
   configureAccessoryInformation() {
@@ -181,6 +199,13 @@ export class SleepysElitePlatformAccessory {
       return;
     }
 
+    if (!this.bed) {
+      this.log.debug(
+        `Ignored ${zone} ${finalValue}% because Bluetooth is unavailable.`,
+      );
+      return;
+    }
+
     try {
       const result = await this.bed.set(zone, finalValue);
 
@@ -256,6 +281,8 @@ export class SleepysElitePlatformAccessory {
       clearTimeout(timer);
     }
 
-    await this.bed.shutdown();
+    if (this.bed) {
+      await this.bed.shutdown();
+    }
   }
 }

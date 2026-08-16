@@ -26,8 +26,15 @@ export class SleepysElitePlatform {
   }
 
   discoverBed() {
-    const name = this.config.name || "Sleepy's Elite";
-    const deviceNamePrefix = this.config.deviceNamePrefix || 'Star25';
+    if (!this.config.name || !this.config.deviceNamePrefix) {
+      this.log.info(
+        "Sleepy's Elite is not configured yet. Add a name and Bluetooth name prefix in plugin settings.",
+      );
+      return;
+    }
+
+    const name = this.config.name;
+    const deviceNamePrefix = this.config.deviceNamePrefix;
     const uuid = this.api.hap.uuid.generate(
       `${PLUGIN_NAME}:bed:${deviceNamePrefix}`,
     );
