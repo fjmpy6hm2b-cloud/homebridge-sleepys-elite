@@ -11,9 +11,7 @@ export class SleepysElitePlatform {
 
     this.log.debug("Finished initializing Sleepy's Elite platform.");
 
-    this.api.on('didFinishLaunching', () => {
-      this.discoverBed();
-    });
+    this.api.on('didFinishLaunching', () => this.discoverBed());
 
     this.api.on('shutdown', () => {
       for (const controller of this.controllers.values()) {
@@ -30,7 +28,6 @@ export class SleepysElitePlatform {
   discoverBed() {
     const name = this.config.name || "Sleepy's Elite";
     const deviceNamePrefix = this.config.deviceNamePrefix || 'Star25';
-
     const uuid = this.api.hap.uuid.generate(
       `${PLUGIN_NAME}:bed:${deviceNamePrefix}`,
     );
@@ -57,9 +54,7 @@ export class SleepysElitePlatform {
     }
 
     for (const [cachedUuid, cachedAccessory] of this.accessories.entries()) {
-      if (cachedUuid === uuid) {
-        continue;
-      }
+      if (cachedUuid === uuid) continue;
 
       this.log.info(
         `Removing stale accessory from cache: ${cachedAccessory.displayName}`,

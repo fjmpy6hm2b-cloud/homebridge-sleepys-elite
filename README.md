@@ -6,35 +6,31 @@ Unofficial Homebridge dynamic-platform plugin for Sleepy's Elite / BOX25 adjusta
 
 - Head, feet, and lumbar position control
 - Under-bed light on/off and brightness
-- Persistent Bluetooth worker with automatic reconnect
+- Persistent Bluetooth connection with automatic reconnect
 - Physical-remote position updates reflected in HomeKit
 - Debounced slider commands
 - One motor movement at a time to prevent overlapping motor commands
+- Native Node.js Bluetooth over BlueZ/D-Bus
+- No Python, virtual environment, or Bleak setup
 
 ## Requirements
 
 - Homebridge 2.x
-- Node.js 22 or 24
-- Linux with Bluetooth / BlueZ
-- Python 3
-- Python package `bleak`
+- Node.js 22.12+ or 24.x
+- Linux/Homebridge host with Bluetooth and BlueZ
 
-The plugin does not modify the host system during npm installation. Install Bleak into the Python environment Homebridge should use, then set **Python Executable** in the plugin settings if it is not simply `python3`.
+On a standard Homebridge Raspberry Pi image, installation is intended to be:
 
-Example:
+1. Install the plugin in Homebridge.
+2. Leave the Bluetooth name prefix as `Star25` unless your bed advertises differently.
+3. Save/restart Homebridge.
 
-```bash
-python3 -m venv ~/sleepys-venv
-~/sleepys-venv/bin/pip install bleak
-```
-
-Then set **Python Executable** to the full path of that environment's Python binary.
+No Python setup is required.
 
 ## Configuration
 
-This plugin uses Homebridge's dynamic-platform architecture. Add the **Sleepy's Elite** platform in the Homebridge UI.
-
-The default Bluetooth advertising-name prefix is `Star25`.
+- **Name:** HomeKit accessory name.
+- **Bed Bluetooth Name Prefix:** defaults to `Star25`.
 
 ## Current status
 
