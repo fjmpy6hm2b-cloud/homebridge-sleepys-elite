@@ -24,9 +24,15 @@ export class SleepysElitePlatformAccessory {
     };
 
     this.lightOn = false;
+    this.color = {
+      hue: 0,
+      saturation: 0,
+    };
     this.services = {};
     this.motorDebounceMs = 700;
     this.lightDebounceMs = 700;
+    this.colorDebounceMs = 250;
+    this.colorDebounceTimer = null;
     this.debounceTimers = {};
     this.pendingValues = {};
     this.lastSent = {};
@@ -105,6 +111,30 @@ export class SleepysElitePlatformAccessory {
 
     this.services[zone] = service;
 
+    if (zone === 'led') {
+      service
+        .getCharacteristic(this.Characteristic.Hue)
+        .onGet(() => this.color.hue)
+        .onSet(async (value) => {
+          this.color.hue = Math.max(
+            0,
+            Math.min(360, Number(value)),
+          );
+          this.scheduleColorSet();
+        });
+
+      service
+        .getCharacteristic(this.Characteristic.Saturation)
+        .onGet(() => this.color.saturation)
+        .onSet(async (value) => {
+          this.color.saturation = Math.max(
+            0,
+            Math.min(100, Number(value)),
+          );
+          this.scheduleColorSet();
+        });
+    }
+
     service
       .getCharacteristic(this.Characteristic.On)
       .onGet(() => {
@@ -155,6 +185,100 @@ export class SleepysElitePlatformAccessory {
           this.scheduleSet(zone, position, this.motorDebounceMs);
         }
       });
+  }
+
+  scheduleColorSet() {
+    if (this.colorDebounceTimer) {
+      clearTimeout(this.colorDebounceTimer);
+    }
+
+    this.colorDebounceTimer = setTimeout(async () => {
+      this.colorDebounceTimer = null;
+
+      if (!this.bed) {
+        this.log.debug(
+          'Ignored color change because Bluetooth is unavailable.',
+        );
+        return;
+      }
+
+      const { red, green, blue } = this.hsvToRgb(
+        this.color.hue,
+        this.color.saturation,
+      );
+
+      try {
+        await this.bed.setColor(red, green, blue);
+      } catch (error) {
+        this.log.warn(`Failed to set light color: ${error.message}`);
+      }
+    }, this.colorDebounceMs);
+  }
+
+  hsvToRgb(hue, saturation) {
+    const h = ((Number(hue) % 360) + 360) % 360;
+    const s = Math.max(0, Math.min(100, Number(saturation))) / 100;
+
+    const c = s;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m = 1 - c;
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+
+    if (h < 60) {
+      r = c; g = x;
+    } else if (h < 120) {
+      r = x; g = c;
+    } else if (h < 180) {
+      g = c; b = x;
+    } else if (h < 240) {
+      g = x; b = c;
+    } else if (h < 300) {
+      r = x; b = c;
+    } else {
+      r = c; b = x;
+    }
+
+    return {
+      red: Math.round((r + m) * 255),
+      green: Math.round((g + m) * 255),
+      blue: Math.round((b + m) * 255),
+    };
+  }
+
+  rgbToHsv(red, green, blue) {
+    const r = red / 255;
+    const g = green / 255;
+    const b = blue / 255;
+
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+
+    let hue = 0;
+
+    if (delta !== 0) {
+      if (max === r) {
+        hue = 60 * (((g - b) / delta) % 6);
+      } else if (max === g) {
+        hue = 60 * (((b - r) / delta) + 2);
+      } else {
+        hue = 60 * (((r - g) / delta) + 4);
+      }
+    }
+
+    if (hue < 0) {
+      hue += 360;
+    }
+
+    const saturation = max === 0 ? 0 : (delta / max) * 100;
+
+    return {
+      hue: Math.round(hue),
+      saturation: Math.round(saturation),
+    };
   }
 
   cancelDebounce(zone) {
@@ -258,6 +382,37 @@ export class SleepysElitePlatformAccessory {
     }
   }
 
+  updateColorState(rgb) {
+    if (
+      typeof rgb?.red !== 'number' ||
+      typeof rgb?.green !== 'number' ||
+      typeof rgb?.blue !== 'number'
+    ) {
+      return;
+    }
+
+    const color = this.rgbToHsv(
+      rgb.red,
+      rgb.green,
+      rgb.blue,
+    );
+
+    this.color = color;
+
+    this.services.led
+      .getCharacteristic(this.Characteristic.Hue)
+      .updateValue(color.hue);
+
+    this.services.led
+      .getCharacteristic(this.Characteristic.Saturation)
+      .updateValue(color.saturation);
+
+    this.log.debug(
+      `Light color: RGB(${rgb.red}, ${rgb.green}, ${rgb.blue}) ` +
+      `Hue ${color.hue}°, Saturation ${color.saturation}%`,
+    );
+  }
+
   updateLightState(on) {
     this.lightOn = Boolean(on);
 
@@ -279,6 +434,11 @@ export class SleepysElitePlatformAccessory {
   async shutdown() {
     for (const timer of Object.values(this.debounceTimers)) {
       clearTimeout(timer);
+    }
+
+    if (this.colorDebounceTimer) {
+      clearTimeout(this.colorDebounceTimer);
+      this.colorDebounceTimer = null;
     }
 
     if (this.bed) {
