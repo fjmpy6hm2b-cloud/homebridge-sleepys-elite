@@ -1,11 +1,13 @@
 # homebridge-sleepys-elite
 
+[![verified-by-homebridge](https://img.shields.io/badge/_-verified-blueviolet?color=%23491F59&style=flat&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
+
 Unofficial Homebridge dynamic-platform plugin for Sleepy's Elite / BOX25 adjustable beds.
 
 ## Features
 
 - Head, feet, and lumbar position control
-- Under-bed light on/off and brightness
+- Under-bed light on/off, 0–100% brightness, and full RGB color control
 - Persistent Bluetooth connection with automatic reconnect
 - Physical-remote position updates reflected in HomeKit
 - Debounced slider commands
@@ -55,3 +57,8 @@ See `THIRD_PARTY_NOTICES.md` for attribution details.
 ## License
 
 MIT
+
+
+### Split-bed systems
+
+The plugin supports one adjustable-base controller per Homebridge plugin instance. Split-bed configurations with two independent controllers are not supported.

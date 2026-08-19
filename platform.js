@@ -55,6 +55,7 @@ export class SleepysElitePlatform {
       this.log.info(`Registered new accessory: ${name}`);
     } else {
       accessory.displayName = name;
+      accessory.updateDisplayName(name);
       accessory.context.deviceNamePrefix = deviceNamePrefix;
       this.api.updatePlatformAccessories([accessory]);
       this.log.info(`Restoring existing accessory from cache: ${name}`);

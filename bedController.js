@@ -21,6 +21,7 @@ export class SleepysBedController {
 
     this.onPosition = options.onPosition || (() => {});
     this.onLightState = options.onLightState || (() => {});
+    this.onColorState = options.onColorState || (() => {});
 
     this.bluetoothHandle = null;
     this.bluetooth = null;
@@ -226,6 +227,45 @@ export class SleepysBedController {
     ]);
   }
 
+  buildColorCommand(red, green, blue) {
+    const clamp = (value) =>
+      Math.max(0, Math.min(255, Math.round(Number(value))));
+
+    return Buffer.from([
+      0x5A,
+      0xE0,
+      0x04,
+      0x02,
+      clamp(red),
+      clamp(green),
+      clamp(blue),
+      0xA5,
+    ]);
+  }
+
+  async setColor(red, green, blue) {
+    try {
+      await this.ensureConnected();
+
+      const frame = this.buildColorCommand(red, green, blue);
+
+      await this.tx.writeValueWithoutResponse(frame);
+
+      this.log.info(
+        `Sent color RGB(${frame[4]}, ${frame[5]}, ${frame[6]})`,
+      );
+
+      return { sent: true };
+    } catch (error) {
+      if (!this.stopping) {
+        await this.cleanupConnection();
+        this.scheduleReconnect();
+      }
+
+      throw error;
+    }
+  }
+
   buildLightCommands(value) {
     if (value === 0) {
       return [Buffer.from('5A0103103074A5', 'hex')];
@@ -384,6 +424,21 @@ export class SleepysBedController {
         this.onLightState(true);
       } else if (data[14] === 0x60) {
         this.onLightState(false);
+      }
+
+      // BOX25 lighting state:
+      // 0x31-0x37 = OEM presets, 0x38 = direct RGB mode.
+      // RGB values are reported in bytes 16-18.
+      if (
+        data.length >= 19 &&
+        data[14] >= 0x31 &&
+        data[14] <= 0x38
+      ) {
+        this.onColorState({
+          red: data[16],
+          green: data[17],
+          blue: data[18],
+        });
       }
     }
   }
