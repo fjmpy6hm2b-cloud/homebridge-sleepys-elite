@@ -145,16 +145,35 @@ export class SleepysElitePlatformAccessory {
         const on = Boolean(value);
 
         if (zone === 'led') {
-          if (!on) {
-            this.cancelDebounce(zone);
-            this.values.led = 0;
-            this.lightOn = false;
-            await this.sendSet('led', 0);
-          } else {
-            const target = this.values.led > 0 ? this.values.led : 100;
-            this.values.led = target;
-            this.lightOn = true;
-            this.scheduleSet('led', target, this.lightDebounceMs);
+          this.cancelDebounce(zone);
+
+          if (!this.bed) {
+            this.log.debug(
+              `Ignored light ${on ? 'on' : 'off'} because Bluetooth is unavailable.`,
+            );
+            return;
+          }
+
+          try {
+            await this.bed.setLightPower(on);
+            this.lightOn = on;
+
+            if (!on) {
+              this.values.led = 0;
+            } else {
+              // BOX25's dedicated ON command resets the LEDs to white,
+              // so restore the HomeKit-selected RGB color immediately.
+              const { red, green, blue } = this.hsvToRgb(
+                this.color.hue,
+                this.color.saturation,
+              );
+
+              await this.bed.setColor(red, green, blue);
+            }
+          } catch (error) {
+            this.log.warn(
+              `Failed to turn light ${on ? 'on' : 'off'}: ${error.message}`,
+            );
           }
 
           return;
@@ -171,20 +190,52 @@ export class SleepysElitePlatformAccessory {
       .getCharacteristic(this.Characteristic.Brightness)
       .onGet(() => this.values[zone])
       .onSet(async (value) => {
-        const position = Math.max(
+        const requested = Math.max(
           0,
           Math.min(100, Math.round(Number(value))),
         );
+
+        const position = zone === 'led'
+          ? this.snapLightBrightness(requested)
+          : requested;
 
         this.values[zone] = position;
 
         if (zone === 'led') {
           this.lightOn = position > 0;
+
+          // Report the actual BOX25 brightness step back to HomeKit so
+          // the slider settles on 17/33/50/67/83/100 instead of showing
+          // precision the hardware does not support.
+          if (position !== requested) {
+            this.services.led
+              .getCharacteristic(this.Characteristic.Brightness)
+              .updateValue(position);
+          }
+
           this.scheduleSet(zone, position, this.lightDebounceMs);
         } else {
           this.scheduleSet(zone, position, this.motorDebounceMs);
         }
       });
+  }
+
+  snapLightBrightness(value) {
+    const requested = Math.max(
+      0,
+      Math.min(100, Math.round(Number(value))),
+    );
+
+    if (requested === 0) {
+      return 0;
+    }
+
+    const level = Math.max(
+      1,
+      Math.min(6, Math.round(requested * 6 / 100)),
+    );
+
+    return Math.round(level * 100 / 6);
   }
 
   scheduleColorSet() {
@@ -199,6 +250,13 @@ export class SleepysElitePlatformAccessory {
         this.log.debug(
           'Ignored color change because Bluetooth is unavailable.',
         );
+        return;
+      }
+
+      // Remember HomeKit color changes while the light is off, but do not
+      // transmit them because a direct RGB command also illuminates the LEDs.
+      if (!this.lightOn) {
+        this.log.debug('Stored light color while light is off.');
         return;
       }
 
@@ -418,8 +476,6 @@ export class SleepysElitePlatformAccessory {
 
     if (!this.lightOn) {
       this.values.led = 0;
-    } else if (this.values.led === 0) {
-      this.values.led = 100;
     }
 
     this.services.led
