@@ -266,26 +266,46 @@ export class SleepysBedController {
     }
   }
 
-  buildLightCommands(value) {
-    if (value === 0) {
-      return [Buffer.from('5A0103103074A5', 'hex')];
+  buildBrightnessCommand(value) {
+    const level = Math.max(
+      1,
+      Math.min(6, Math.round(Number(value) * 6 / 100)),
+    );
+
+    return Buffer.from([
+      0x5A,
+      0xE0,
+      0x04,
+      0x00,
+      level,
+      0x00,
+      0x00,
+      0xA5,
+    ]);
+  }
+
+  async setLightPower(on) {
+    try {
+      await this.ensureConnected();
+
+      const frame = Buffer.from(
+        on ? '5A0103103073A5' : '5A0103103074A5',
+        'hex',
+      );
+
+      await this.tx.writeValueWithoutResponse(frame);
+
+      this.log.info(`Sent led ${on ? 'on' : 'off'}`);
+
+      return { sent: true };
+    } catch (error) {
+      if (!this.stopping) {
+        await this.cleanupConnection();
+        this.scheduleReconnect();
+      }
+
+      throw error;
     }
-
-    const level = Math.max(1, Math.round(value * 6 / 100));
-
-    return [
-      Buffer.from('5A0103103073A5', 'hex'),
-      Buffer.from([
-        0x5A,
-        0xE0,
-        0x04,
-        0x00,
-        level,
-        0x00,
-        0x00,
-        0xA5,
-      ]),
-    ];
   }
 
   motorTimeoutFor(zone, target) {
@@ -306,10 +326,13 @@ export class SleepysBedController {
       await this.ensureConnected();
 
       if (zone === 'led') {
-        for (const frame of this.buildLightCommands(value)) {
-          await this.tx.writeValueWithoutResponse(frame);
-          await sleep(100);
+        if (value === 0) {
+          return this.setLightPower(false);
         }
+
+        const frame = this.buildBrightnessCommand(value);
+
+        await this.tx.writeValueWithoutResponse(frame);
 
         this.log.info(`Sent led ${value}%`);
         return { sent: true };
