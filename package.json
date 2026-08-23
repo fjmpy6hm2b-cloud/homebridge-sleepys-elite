@@ -2,7 +2,7 @@
   "name": "homebridge-sleepys-elite",
   "displayName": "Sleepy's Elite",
   "type": "module",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Homebridge dynamic platform plugin for Sleepy's Elite / BOX25 adjustable beds",
   "author": "Max S",
   "license": "MIT",

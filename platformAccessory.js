@@ -24,6 +24,13 @@ export class SleepysElitePlatformAccessory {
     };
 
     this.lightOn = false;
+    const storedLightBrightness = Number(
+      this.accessory.context.lastLightBrightness,
+    );
+    this.lastLightBrightness = Number.isFinite(storedLightBrightness) &&
+      storedLightBrightness > 0
+      ? Math.max(1, Math.min(100, Math.round(storedLightBrightness)))
+      : 100;
     this.color = {
       hue: 0,
       saturation: 0,
@@ -62,16 +69,24 @@ export class SleepysElitePlatformAccessory {
     try {
       const { SleepysBedController } = await import('./bedController.js');
 
-      this.bed = new SleepysBedController(this.log, {
-        deviceNamePrefix: this.deviceNamePrefix,
-        onPosition: (position) => this.updatePosition(position),
-        onLightState: (on) => this.updateLightState(on),
-      });
+      this.bed = new SleepysBedController(
+        this.log,
+        this.controllerOptions(),
+      );
 
       await this.bed.start();
     } catch (error) {
       this.log.warn(`Bluetooth is unavailable: ${error.message}`);
     }
+  }
+
+  controllerOptions() {
+    return {
+      deviceNamePrefix: this.deviceNamePrefix,
+      onPosition: (position) => this.updatePosition(position),
+      onLightState: (on) => this.updateLightState(on),
+      onColorState: (rgb) => this.updateColorState(rgb),
+    };
   }
 
   configureAccessoryInformation() {
@@ -155,12 +170,28 @@ export class SleepysElitePlatformAccessory {
           }
 
           try {
-            await this.bed.setLightPower(on);
-            this.lightOn = on;
-
             if (!on) {
+              this.rememberLightBrightness(this.values.led);
+              await this.bed.setLightPower(false);
+              this.lightOn = false;
               this.values.led = 0;
+
+              this.services.led
+                .getCharacteristic(this.Characteristic.Brightness)
+                .updateValue(0);
             } else {
+              await this.bed.setLightPower(true);
+              this.lightOn = true;
+              this.values.led = this.lastLightBrightness;
+
+              this.services.led
+                .getCharacteristic(this.Characteristic.Brightness)
+                .updateValue(this.values.led);
+
+              // Restore the last hardware brightness after BOX25's dedicated
+              // ON command, which otherwise returns to its own default level.
+              await this.bed.set('led', this.values.led);
+
               // BOX25's dedicated ON command resets the LEDs to white,
               // so restore the HomeKit-selected RGB color immediately.
               const { red, green, blue } = this.hsvToRgb(
@@ -199,9 +230,14 @@ export class SleepysElitePlatformAccessory {
           ? this.snapLightBrightness(requested)
           : requested;
 
-        this.values[zone] = position;
-
         if (zone === 'led') {
+          if (position > 0) {
+            this.rememberLightBrightness(position);
+          } else {
+            this.rememberLightBrightness(this.values.led);
+          }
+
+          this.values.led = position;
           this.lightOn = position > 0;
 
           // Report the actual BOX25 brightness step back to HomeKit so
@@ -215,9 +251,25 @@ export class SleepysElitePlatformAccessory {
 
           this.scheduleSet(zone, position, this.lightDebounceMs);
         } else {
+          this.values[zone] = position;
           this.scheduleSet(zone, position, this.motorDebounceMs);
         }
       });
+  }
+
+  rememberLightBrightness(value) {
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return;
+
+    const brightness = Math.max(
+      0,
+      Math.min(100, Math.round(numericValue)),
+    );
+
+    if (brightness <= 0) return;
+
+    this.lastLightBrightness = brightness;
+    this.accessory.context.lastLightBrightness = brightness;
   }
 
   snapLightBrightness(value) {
@@ -394,6 +446,8 @@ export class SleepysElitePlatformAccessory {
       if (result?.sent !== false) {
         this.lastSent[zone] = finalValue;
         this.lastSentAt[zone] = now;
+      } else if (result?.queued) {
+        this.log.debug(`Queued ${zone} ${finalValue}% for the bed controller.`);
       }
     } catch (error) {
       this.log.warn(`Failed to set ${zone} to ${finalValue}%: ${error.message}`);
@@ -475,7 +529,10 @@ export class SleepysElitePlatformAccessory {
     this.lightOn = Boolean(on);
 
     if (!this.lightOn) {
+      this.rememberLightBrightness(this.values.led);
       this.values.led = 0;
+    } else if (this.values.led === 0) {
+      this.values.led = this.lastLightBrightness;
     }
 
     this.services.led
@@ -499,6 +556,7 @@ export class SleepysElitePlatformAccessory {
 
     if (this.bed) {
       await this.bed.shutdown();
+      this.bed = null;
     }
   }
 }

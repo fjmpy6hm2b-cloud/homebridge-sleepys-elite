@@ -13,10 +13,12 @@ export class SleepysElitePlatform {
 
     this.api.on('didFinishLaunching', () => this.discoverBed());
 
-    this.api.on('shutdown', () => {
-      for (const controller of this.controllers.values()) {
-        controller.shutdown();
-      }
+    this.api.on('shutdown', async () => {
+      await Promise.allSettled(
+        [...this.controllers.values()].map((controller) =>
+          controller.shutdown(),
+        ),
+      );
     });
   }
 

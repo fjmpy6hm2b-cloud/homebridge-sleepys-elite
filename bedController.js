@@ -17,6 +17,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export class SleepysBedController {
   constructor(log, options = {}) {
     this.log = log;
+    this.createBluetooth = options.createBluetooth || createBluetooth;
     this.deviceNamePrefix = options.deviceNamePrefix || 'Star25';
 
     this.onPosition = options.onPosition || (() => {});
@@ -28,14 +29,17 @@ export class SleepysBedController {
     this.destroyBluetooth = null;
     this.adapter = null;
     this.device = null;
+    this.gatt = null;
     this.tx = null;
     this.rx = null;
 
     this.connected = false;
     this.stopping = false;
     this.connectPromise = null;
+    this.cleanupPromise = null;
     this.recoveryPromise = null;
     this.reconnectTimer = null;
+    this.writeQueue = Promise.resolve();
 
     this.positions = {
       head: null,
@@ -48,26 +52,86 @@ export class SleepysBedController {
     this.motorTarget = null;
     this.motorStartedAt = 0;
     this.motorTimeout = null;
+    this.motorReleaseTimer = null;
     this.motorMinBusyMs = 1000;
+    this.pendingMotorCommands = new Map();
+    this.motorQueueDispatching = false;
   }
 
   async start() {
     this.stopping = false;
-    await this.ensureConnected();
+
+    try {
+      await this.ensureConnected();
+    } catch (error) {
+      if (!this.stopping) {
+        this.log.warn(
+          `Initial Bluetooth connection failed (${error.message}); retrying in the background.`,
+        );
+        this.scheduleReconnect();
+      }
+    }
   }
 
   async ensureBluetooth() {
-    if (this.bluetooth) return;
+    if (this.cleanupPromise) {
+      await this.cleanupPromise;
+    }
 
-    this.bluetoothHandle = createBluetooth();
-    this.bluetooth = this.bluetoothHandle.bluetooth;
-    this.destroyBluetooth = this.bluetoothHandle.destroy;
-    this.adapter = await this.bluetooth.defaultAdapter();
+    if (this.bluetooth && this.adapter) return;
+
+    // A previous defaultAdapter() call may have failed after opening D-Bus.
+    // Never reuse that half-initialized session.
+    this.destroyBluetoothSession();
+
+    const bluetoothHandle = this.createBluetooth();
+
+    try {
+      const adapter = await bluetoothHandle.bluetooth.defaultAdapter();
+
+      if (this.stopping) {
+        throw new Error('Controller is stopping');
+      }
+
+      this.bluetoothHandle = bluetoothHandle;
+      this.bluetooth = bluetoothHandle.bluetooth;
+      this.destroyBluetooth = bluetoothHandle.destroy;
+      this.adapter = adapter;
+    } catch (error) {
+      try {
+        bluetoothHandle.destroy();
+      } catch {
+        // Preserve the adapter initialization error.
+      }
+
+      throw error;
+    }
+  }
+
+  destroyBluetoothSession() {
+    const destroyBluetooth = this.destroyBluetooth;
+
+    this.bluetoothHandle = null;
+    this.bluetooth = null;
+    this.destroyBluetooth = null;
+    this.adapter = null;
+
+    if (destroyBluetooth) {
+      try {
+        destroyBluetooth();
+      } catch (error) {
+        this.log.debug(`Failed to close Bluetooth D-Bus session: ${error.message}`);
+      }
+    }
   }
 
   async ensureConnected() {
     if (this.stopping) {
       throw new Error('Controller is stopping');
+    }
+
+    if (this.cleanupPromise) {
+      await this.cleanupPromise;
     }
 
     if (this.connectPromise) {
@@ -94,25 +158,23 @@ export class SleepysBedController {
       return this.connectPromise;
     }
 
-    this.connectPromise = this.connectLoop();
-
-    try {
-      await this.connectPromise;
-    } finally {
-      this.connectPromise = null;
-    }
-  }
-
-  async connectLoop() {
-    while (!this.stopping) {
+    const connectionAttempt = (async () => {
       try {
         await this.connectOnce();
-        return;
       } catch (error) {
         this.connected = false;
-        this.log.debug(`Bluetooth connect failed: ${error.message}`);
         await this.cleanupConnection();
-        await sleep(2000);
+        throw error;
+      }
+    })();
+
+    this.connectPromise = connectionAttempt;
+
+    try {
+      await connectionAttempt;
+    } finally {
+      if (this.connectPromise === connectionAttempt) {
+        this.connectPromise = null;
       }
     }
   }
@@ -176,11 +238,13 @@ export class SleepysBedController {
     await device.connect();
 
     const gatt = await device.gatt();
+    this.gatt = gatt;
+
     const service = await gatt.getPrimaryService(SERVICE_UUID);
     const tx = await service.getCharacteristic(TX_UUID);
-    const rx = await service.getCharacteristic(RX_UUID);
-
     this.tx = tx;
+
+    const rx = await service.getCharacteristic(RX_UUID);
     this.rx = rx;
 
     // Proven working sequence for BOX25:
@@ -197,42 +261,72 @@ export class SleepysBedController {
     this.connected = true;
 
     this.log.info("Sleepy's Elite Bluetooth connected.");
+    this.drainMotorQueue();
   }
 
   async cleanupConnection() {
-    this.connected = false;
+    if (this.cleanupPromise) {
+      return this.cleanupPromise;
+    }
 
-    const rx = this.rx;
-    const tx = this.tx;
-    const device = this.device;
+    const cleanup = (async () => {
+      this.connected = false;
 
-    this.tx = null;
-    this.rx = null;
-    this.device = null;
+      const rx = this.rx;
+      const tx = this.tx;
+      const device = this.device;
+      const gatt = this.gatt;
 
-    if (rx) {
-      try {
-        await rx.stopNotifications();
-      } catch {
-        // A stale GATT object cannot accept StopNotify. Listener cleanup below
-        // must still run so old D-Bus PropertiesChanged handlers do not pile up.
-      } finally {
-        rx.removeAllListeners?.('valuechanged');
-        rx.helper?.removeListeners?.();
+      this.tx = null;
+      this.rx = null;
+      this.device = null;
+      this.gatt = null;
+
+      if (rx) {
+        try {
+          await rx.stopNotifications();
+        } catch {
+          // A stale GATT object cannot accept StopNotify. Listener cleanup below
+          // must still run so old D-Bus PropertiesChanged handlers do not pile up.
+        } finally {
+          rx.removeAllListeners?.('valuechanged');
+          rx.helper?.removeListeners?.();
+        }
       }
-    }
 
-    if (tx && tx !== rx) {
-      tx.helper?.removeListeners?.();
-    }
+      if (tx && tx !== rx) {
+        tx.removeAllListeners?.();
+        tx.helper?.removeListeners?.();
+      }
 
-    if (device) {
-      try {
-        await device.disconnect();
-      } catch {
-        // BlueZ may already have removed the device object.
-      } finally {
-        this.removeDeviceListeners(device);
+      // node-ble initializes helpers for every service/characteristic while it
+      // resolves the GATT tree, not only the two characteristics we retain.
+      // Dispose the whole tree so repeated reconnects cannot accumulate hidden
+      // PropertiesChanged listeners.
+      this.removeGattListeners(gatt);
+
+      if (device) {
+        try {
+          await device.disconnect();
+        } catch {
+          // BlueZ may already have removed the device object.
+        } finally {
+          this.removeDeviceListeners(device);
+        }
+      }
+
+      // Recreate the D-Bus session after every failed/stale connection. This is
+      // the final safety net for node-ble proxy objects that are not public.
+      this.destroyBluetoothSession();
+    })();
+
+    this.cleanupPromise = cleanup;
+
+    try {
+      await cleanup;
+    } finally {
+      if (this.cleanupPromise === cleanup) {
+        this.cleanupPromise = null;
       }
     }
   }
@@ -240,6 +334,23 @@ export class SleepysBedController {
   removeDeviceListeners(device) {
     device?.removeAllListeners?.();
     device?.helper?.removeListeners?.();
+  }
+
+  removeGattListeners(gatt) {
+    if (!gatt) return;
+
+    for (const service of Object.values(gatt._services || {})) {
+      for (const characteristic of Object.values(
+        service?._characteristics || {},
+      )) {
+        characteristic?.removeAllListeners?.();
+        characteristic?.helper?.removeListeners?.();
+      }
+
+      service?.helper?.removeListeners?.();
+    }
+
+    gatt.helper?.removeListeners?.();
   }
 
   isStaleConnectionError(error) {
@@ -285,24 +396,70 @@ export class SleepysBedController {
     }
   }
 
-  async writeFrame(frame, connectionChecked = false) {
-    if (!connectionChecked) {
-      await this.ensureConnected();
-    }
+  writeFrame(frame) {
+    const queuedFrame = Buffer.from(frame);
+    const operation = this.writeQueue.then(() =>
+      this.writeFrameNow(queuedFrame),
+    );
+
+    // Keep the queue usable after a failed command while returning the original
+    // rejection to its caller.
+    this.writeQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  async writeFrameNow(frame) {
+    await this.ensureConnected();
 
     const tx = this.tx;
+
+    if (!tx) {
+      const error = new Error(
+        'Bluetooth transmit characteristic is unavailable',
+      );
+
+      if (!this.stopping) {
+        await this.cleanupConnection();
+      }
+
+      throw error;
+    }
 
     try {
       await tx.writeValueWithoutResponse(frame);
     } catch (error) {
       if (this.stopping || !this.isStaleConnectionError(error)) {
+        if (!this.stopping) {
+          await this.cleanupConnection();
+        }
+
         throw error;
       }
 
       await this.recoverStaleConnection(tx, error);
 
       // Retry the original frame exactly once on the replacement GATT object.
-      await this.tx.writeValueWithoutResponse(frame);
+      if (!this.tx) {
+        const retryError = new Error(
+          'Bluetooth transmit characteristic is unavailable',
+        );
+
+        if (!this.stopping) {
+          await this.cleanupConnection();
+        }
+
+        throw retryError;
+      }
+
+      try {
+        await this.tx.writeValueWithoutResponse(frame);
+      } catch (retryError) {
+        if (!this.stopping) {
+          await this.cleanupConnection();
+        }
+
+        throw retryError;
+      }
     }
   }
 
@@ -364,7 +521,6 @@ export class SleepysBedController {
       return { sent: true };
     } catch (error) {
       if (!this.stopping) {
-        await this.cleanupConnection();
         this.scheduleReconnect();
       }
 
@@ -404,7 +560,6 @@ export class SleepysBedController {
       return { sent: true };
     } catch (error) {
       if (!this.stopping) {
-        await this.cleanupConnection();
         this.scheduleReconnect();
       }
 
@@ -427,8 +582,6 @@ export class SleepysBedController {
     const value = Math.max(0, Math.min(100, Math.round(Number(rawValue))));
 
     try {
-      await this.ensureConnected();
-
       if (zone === 'led') {
         if (value === 0) {
           return this.setLightPower(false);
@@ -436,7 +589,7 @@ export class SleepysBedController {
 
         const frame = this.buildBrightnessCommand(value);
 
-        await this.writeFrame(frame, true);
+        await this.writeFrame(frame);
 
         this.log.info(`Sent led ${value}%`);
         return { sent: true };
@@ -448,12 +601,15 @@ export class SleepysBedController {
 
       if (this.motorBusy) {
         this.log.debug(
-          `Ignored ${zone} ${value}% while ${this.motorZone} is moving to ${this.motorTarget}%.`,
+          `Queued ${zone} ${value}% while ${this.motorZone} is moving to ${this.motorTarget}%.`,
         );
+
+        this.pendingMotorCommands.set(zone, value);
 
         return {
           sent: false,
-          reason: 'motor-busy',
+          queued: true,
+          reason: 'motor-queued',
         };
       }
 
@@ -473,7 +629,7 @@ export class SleepysBedController {
       }, timeoutMs);
 
       try {
-        await this.writeFrame(this.buildMotorCommand(zone, value), true);
+        await this.writeFrame(this.buildMotorCommand(zone, value));
 
         this.log.info(`Sent ${zone} ${value}%`);
 
@@ -484,7 +640,6 @@ export class SleepysBedController {
       }
     } catch (error) {
       if (!this.stopping) {
-        await this.cleanupConnection();
         this.scheduleReconnect();
       }
 
@@ -500,7 +655,12 @@ export class SleepysBedController {
     const elapsed = Date.now() - this.motorStartedAt;
 
     if (reason === 'target' && elapsed < this.motorMinBusyMs) {
-      setTimeout(() => {
+      if (this.motorReleaseTimer) {
+        clearTimeout(this.motorReleaseTimer);
+      }
+
+      this.motorReleaseTimer = setTimeout(() => {
+        this.motorReleaseTimer = null;
         this.releaseMotor('target-delay');
       }, this.motorMinBusyMs - elapsed);
 
@@ -512,6 +672,11 @@ export class SleepysBedController {
       this.motorTimeout = null;
     }
 
+    if (this.motorReleaseTimer) {
+      clearTimeout(this.motorReleaseTimer);
+      this.motorReleaseTimer = null;
+    }
+
     this.log.debug(
       `Motor ready (${reason}): ${this.motorZone} -> ${this.motorTarget}%`,
     );
@@ -520,6 +685,51 @@ export class SleepysBedController {
     this.motorZone = null;
     this.motorTarget = null;
     this.motorStartedAt = 0;
+
+    if (reason !== 'write-error' && reason !== 'shutdown') {
+      this.drainMotorQueue();
+    }
+  }
+
+  drainMotorQueue() {
+    if (
+      this.stopping ||
+      this.motorBusy ||
+      this.motorQueueDispatching ||
+      this.pendingMotorCommands.size === 0
+    ) {
+      return;
+    }
+
+    this.motorQueueDispatching = true;
+
+    queueMicrotask(async () => {
+      try {
+        if (this.stopping || this.motorBusy) return;
+
+        const next = this.pendingMotorCommands.entries().next().value;
+        if (!next) return;
+
+        const [zone, value] = next;
+        this.pendingMotorCommands.delete(zone);
+
+        try {
+          await this.set(zone, value);
+        } catch (error) {
+          if (!this.stopping) {
+            this.log.warn(
+              `Failed to send queued ${zone} ${value}%: ${error.message}`,
+            );
+          }
+        }
+      } finally {
+        this.motorQueueDispatching = false;
+
+        if (!this.motorBusy && this.pendingMotorCommands.size > 0) {
+          this.drainMotorQueue();
+        }
+      }
+    });
   }
 
   handleNotification(data) {
@@ -581,15 +791,25 @@ export class SleepysBedController {
       this.motorTimeout = null;
     }
 
-    await this.cleanupConnection();
-
-    if (this.destroyBluetooth) {
-      this.destroyBluetooth();
+    if (this.motorReleaseTimer) {
+      clearTimeout(this.motorReleaseTimer);
+      this.motorReleaseTimer = null;
     }
 
-    this.bluetoothHandle = null;
-    this.bluetooth = null;
-    this.destroyBluetooth = null;
-    this.adapter = null;
+    this.pendingMotorCommands.clear();
+    this.releaseMotor('shutdown');
+
+    const pendingWork = [this.connectPromise, this.writeQueue]
+      .filter(Boolean)
+      .map((promise) => Promise.resolve(promise).catch(() => {}));
+
+    if (pendingWork.length > 0) {
+      await Promise.race([
+        Promise.allSettled(pendingWork),
+        sleep(1500),
+      ]);
+    }
+
+    await this.cleanupConnection();
   }
 }
