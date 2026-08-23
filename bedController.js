@@ -34,6 +34,7 @@ export class SleepysBedController {
     this.connected = false;
     this.stopping = false;
     this.connectPromise = null;
+    this.recoveryPromise = null;
     this.reconnectTimer = null;
 
     this.positions = {
@@ -69,8 +70,24 @@ export class SleepysBedController {
       throw new Error('Controller is stopping');
     }
 
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
     if (this.connected && this.device && this.tx && this.rx) {
-      return;
+      try {
+        if (await this.device.isConnected()) {
+          return;
+        }
+
+        this.log.debug('BlueZ reports the cached Bluetooth connection is stale.');
+      } catch (error) {
+        this.log.debug(
+          `Unable to verify the cached Bluetooth connection: ${error.message}`,
+        );
+      }
+
+      await this.cleanupConnection();
     }
 
     if (this.connectPromise) {
@@ -130,6 +147,8 @@ export class SleepysBedController {
           if (name.startsWith(this.deviceNamePrefix)) {
             return device;
           }
+
+          this.removeDeviceListeners(device);
         }
 
         await sleep(1000);
@@ -143,6 +162,7 @@ export class SleepysBedController {
 
   async connectOnce() {
     const device = await this.findDevice();
+    this.device = device;
 
     let name = "Sleepy's Elite";
     try {
@@ -160,6 +180,9 @@ export class SleepysBedController {
     const tx = await service.getCharacteristic(TX_UUID);
     const rx = await service.getCharacteristic(RX_UUID);
 
+    this.tx = tx;
+    this.rx = rx;
+
     // Proven working sequence for BOX25:
     // connect -> wake with response -> subscribe to notifications.
     await tx.writeValueWithResponse(WAKE);
@@ -171,9 +194,6 @@ export class SleepysBedController {
 
     await rx.startNotifications();
 
-    this.device = device;
-    this.tx = tx;
-    this.rx = rx;
     this.connected = true;
 
     this.log.info("Sleepy's Elite Bluetooth connected.");
@@ -183,6 +203,7 @@ export class SleepysBedController {
     this.connected = false;
 
     const rx = this.rx;
+    const tx = this.tx;
     const device = this.device;
 
     this.tx = null;
@@ -190,11 +211,98 @@ export class SleepysBedController {
     this.device = null;
 
     if (rx) {
-      await rx.stopNotifications().catch(() => {});
+      try {
+        await rx.stopNotifications();
+      } catch {
+        // A stale GATT object cannot accept StopNotify. Listener cleanup below
+        // must still run so old D-Bus PropertiesChanged handlers do not pile up.
+      } finally {
+        rx.removeAllListeners?.('valuechanged');
+        rx.helper?.removeListeners?.();
+      }
+    }
+
+    if (tx && tx !== rx) {
+      tx.helper?.removeListeners?.();
     }
 
     if (device) {
-      await device.disconnect().catch(() => {});
+      try {
+        await device.disconnect();
+      } catch {
+        // BlueZ may already have removed the device object.
+      } finally {
+        this.removeDeviceListeners(device);
+      }
+    }
+  }
+
+  removeDeviceListeners(device) {
+    device?.removeAllListeners?.();
+    device?.helper?.removeListeners?.();
+  }
+
+  isStaleConnectionError(error) {
+    const message = `${error?.name || ''} ${error?.message || error || ''}`;
+    const missingGattObject =
+      /(WriteValue|GattCharacteristic).*(doesn't exist|does not exist|UnknownObject|not found|not connected)/i;
+
+    return (
+      missingGattObject.test(message) ||
+      /org\.freedesktop\.DBus\.Error\.UnknownObject/i.test(message) ||
+      /org\.bluez\.Error\.NotConnected/i.test(message)
+    );
+  }
+
+  async recoverStaleConnection(failedTx, error) {
+    if (this.recoveryPromise) {
+      return this.recoveryPromise;
+    }
+
+    const recovery = (async () => {
+      // Another failed command may have been waiting while the first one
+      // replaced the stale characteristic. Do not tear down the fresh link.
+      if (this.connected && this.tx && this.tx !== failedTx) {
+        return;
+      }
+
+      this.log.debug(
+        `Stale Bluetooth GATT connection detected (${error.message}); reconnecting now.`,
+      );
+
+      await this.cleanupConnection();
+      await this.ensureConnected();
+    })();
+
+    this.recoveryPromise = recovery;
+
+    try {
+      await recovery;
+    } finally {
+      if (this.recoveryPromise === recovery) {
+        this.recoveryPromise = null;
+      }
+    }
+  }
+
+  async writeFrame(frame, connectionChecked = false) {
+    if (!connectionChecked) {
+      await this.ensureConnected();
+    }
+
+    const tx = this.tx;
+
+    try {
+      await tx.writeValueWithoutResponse(frame);
+    } catch (error) {
+      if (this.stopping || !this.isStaleConnectionError(error)) {
+        throw error;
+      }
+
+      await this.recoverStaleConnection(tx, error);
+
+      // Retry the original frame exactly once on the replacement GATT object.
+      await this.tx.writeValueWithoutResponse(frame);
     }
   }
 
@@ -245,11 +353,9 @@ export class SleepysBedController {
 
   async setColor(red, green, blue) {
     try {
-      await this.ensureConnected();
-
       const frame = this.buildColorCommand(red, green, blue);
 
-      await this.tx.writeValueWithoutResponse(frame);
+      await this.writeFrame(frame);
 
       this.log.info(
         `Sent color RGB(${frame[4]}, ${frame[5]}, ${frame[6]})`,
@@ -286,14 +392,12 @@ export class SleepysBedController {
 
   async setLightPower(on) {
     try {
-      await this.ensureConnected();
-
       const frame = Buffer.from(
         on ? '5A0103103073A5' : '5A0103103074A5',
         'hex',
       );
 
-      await this.tx.writeValueWithoutResponse(frame);
+      await this.writeFrame(frame);
 
       this.log.info(`Sent led ${on ? 'on' : 'off'}`);
 
@@ -332,7 +436,7 @@ export class SleepysBedController {
 
         const frame = this.buildBrightnessCommand(value);
 
-        await this.tx.writeValueWithoutResponse(frame);
+        await this.writeFrame(frame, true);
 
         this.log.info(`Sent led ${value}%`);
         return { sent: true };
@@ -369,9 +473,7 @@ export class SleepysBedController {
       }, timeoutMs);
 
       try {
-        await this.tx.writeValueWithoutResponse(
-          this.buildMotorCommand(zone, value),
-        );
+        await this.writeFrame(this.buildMotorCommand(zone, value), true);
 
         this.log.info(`Sent ${zone} ${value}%`);
 
