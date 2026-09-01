@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.4 — 2026-08-31
+
+- Add hard deadlines to BlueZ discovery, connection, GATT setup, command writes, and cleanup so a stalled D-Bus call cannot stop background recovery.
+- Remove stale, unpaired bed records through BlueZ after failed setup or disconnect cleanup, then rediscover the controller on a fresh D-Bus session.
+- Recover immediately from local BLE connection aborts, ATT `0x0e` failures, and plugin-level Bluetooth operation timeouts.
+- Back off repeated reconnect attempts from 1 to 30 seconds instead of retrying continuously at a fixed rate.
+- Keep Bluetooth adapter power management outside the plugin; adapter resets remain a manual recovery action.
+- Expand regression coverage for stalled discovery, stalled writes, stalled disconnects, stale-device removal, and reconnect backoff.
+
 ## 1.2.3 — 2026-08-23
 
 - Reset the complete `node-ble` D-Bus session after failed or stale connections so hidden GATT listeners cannot accumulate.

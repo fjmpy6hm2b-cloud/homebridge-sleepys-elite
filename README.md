@@ -8,8 +8,9 @@ Unofficial Homebridge dynamic-platform plugin for Sleepy's Elite / BOX25 adjusta
 
 - Head, feet, and lumbar position control
 - Under-bed light on/off, 0–100% brightness, and full RGB color control
-- Persistent Bluetooth connection with stale-session detection, immediate reconnect, and one-shot command retry
-- Serialized Bluetooth writes and full D-Bus session cleanup on reconnect
+- Persistent Bluetooth connection with stale-session detection, bounded reconnect backoff, and one-shot command retry
+- Hard timeouts for discovery, connection, GATT setup, command writes, and cleanup so stalled BlueZ calls cannot block recovery
+- Serialized Bluetooth writes, stale-device removal, and full D-Bus session cleanup on reconnect
 - Physical-remote position, light-power, and RGB color updates reflected in HomeKit
 - Debounced slider commands
 - Queued motor requests with one motor movement at a time

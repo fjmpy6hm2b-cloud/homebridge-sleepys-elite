@@ -14,6 +14,15 @@ const ZONES = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+class BluetoothOperationTimeoutError extends Error {
+  constructor(operation, timeoutMs) {
+    super(`${operation} timed out after ${timeoutMs}ms`);
+    this.name = 'BluetoothOperationTimeoutError';
+    this.code = 'BLE_OPERATION_TIMEOUT';
+    this.operation = operation;
+  }
+}
+
 export class SleepysBedController {
   constructor(log, options = {}) {
     this.log = log;
@@ -23,6 +32,18 @@ export class SleepysBedController {
     this.onPosition = options.onPosition || (() => {});
     this.onLightState = options.onLightState || (() => {});
     this.onColorState = options.onColorState || (() => {});
+
+    this.operationTimeoutMs = options.operationTimeoutMs || 10000;
+    this.connectTimeoutMs = options.connectTimeoutMs || 15000;
+    this.cleanupTimeoutMs = options.cleanupTimeoutMs || 3000;
+    this.discoveryTimeoutMs = options.discoveryTimeoutMs || 30000;
+    this.reconnectDelaysMs = options.reconnectDelaysMs || [
+      1000,
+      2000,
+      5000,
+      10000,
+      30000,
+    ];
 
     this.bluetoothHandle = null;
     this.bluetooth = null;
@@ -39,6 +60,7 @@ export class SleepysBedController {
     this.cleanupPromise = null;
     this.recoveryPromise = null;
     this.reconnectTimer = null;
+    this.reconnectFailures = 0;
     this.writeQueue = Promise.resolve();
 
     this.positions = {
@@ -73,6 +95,27 @@ export class SleepysBedController {
     }
   }
 
+  async withTimeout(operation, timeoutMs, label) {
+    let timer;
+
+    const work = Promise.resolve().then(operation);
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new BluetoothOperationTimeoutError(label, timeoutMs));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  runBluetoothOperation(operation, label, timeoutMs = this.operationTimeoutMs) {
+    return this.withTimeout(operation, timeoutMs, label);
+  }
+
   async ensureBluetooth() {
     if (this.cleanupPromise) {
       await this.cleanupPromise;
@@ -87,7 +130,10 @@ export class SleepysBedController {
     const bluetoothHandle = this.createBluetooth();
 
     try {
-      const adapter = await bluetoothHandle.bluetooth.defaultAdapter();
+      const adapter = await this.runBluetoothOperation(
+        () => bluetoothHandle.bluetooth.defaultAdapter(),
+        'Bluetooth adapter initialization',
+      );
 
       if (this.stopping) {
         throw new Error('Controller is stopping');
@@ -110,11 +156,14 @@ export class SleepysBedController {
 
   destroyBluetoothSession() {
     const destroyBluetooth = this.destroyBluetooth;
+    const adapter = this.adapter;
 
     this.bluetoothHandle = null;
     this.bluetooth = null;
     this.destroyBluetooth = null;
     this.adapter = null;
+
+    adapter?.helper?.removeListeners?.();
 
     if (destroyBluetooth) {
       try {
@@ -140,7 +189,10 @@ export class SleepysBedController {
 
     if (this.connected && this.device && this.tx && this.rx) {
       try {
-        if (await this.device.isConnected()) {
+        if (await this.runBluetoothOperation(
+          () => this.device.isConnected(),
+          'Bluetooth connection check',
+        )) {
           return;
         }
 
@@ -151,7 +203,7 @@ export class SleepysBedController {
         );
       }
 
-      await this.cleanupConnection();
+      await this.cleanupConnection({ forgetDevice: true });
     }
 
     if (this.connectPromise) {
@@ -163,7 +215,7 @@ export class SleepysBedController {
         await this.connectOnce();
       } catch (error) {
         this.connected = false;
-        await this.cleanupConnection();
+        await this.cleanupConnection({ forgetDevice: true });
         throw error;
       }
     })();
@@ -182,26 +234,45 @@ export class SleepysBedController {
   async findDevice() {
     await this.ensureBluetooth();
 
-    if (!(await this.adapter.isDiscovering())) {
-      await this.adapter.startDiscovery();
+    const adapter = this.adapter;
+    let startedDiscovery = false;
+
+    if (!(await this.runBluetoothOperation(
+      () => adapter.isDiscovering(),
+      'Bluetooth discovery state check',
+    ))) {
+      await this.runBluetoothOperation(
+        () => adapter.startDiscovery(),
+        'Bluetooth discovery start',
+      );
+      startedDiscovery = true;
     }
 
     this.log.debug(
       `Scanning for Sleepy's Elite (${this.deviceNamePrefix}...)`,
     );
 
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + this.discoveryTimeoutMs;
 
     try {
       while (!this.stopping && Date.now() < deadline) {
-        const ids = await this.adapter.devices();
+        const ids = await this.runBluetoothOperation(
+          () => adapter.devices(),
+          'Bluetooth device listing',
+        );
 
         for (const id of ids) {
-          const device = await this.adapter.getDevice(id);
+          const device = await this.runBluetoothOperation(
+            () => adapter.getDevice(id),
+            'Bluetooth device lookup',
+          );
 
           let name = '';
           try {
-            name = await device.getName();
+            name = await this.runBluetoothOperation(
+              () => device.getName(),
+              'Bluetooth device name lookup',
+            );
           } catch {
             // Ignore transient device-name read errors while scanning.
           }
@@ -216,7 +287,13 @@ export class SleepysBedController {
         await sleep(1000);
       }
     } finally {
-      await this.adapter.stopDiscovery().catch(() => {});
+      if (startedDiscovery) {
+        await this.runBluetoothOperation(
+          () => adapter.stopDiscovery(),
+          'Bluetooth discovery stop',
+          this.cleanupTimeoutMs,
+        ).catch(() => {});
+      }
     }
 
     throw new Error("Sleepy's Elite not found");
@@ -228,43 +305,69 @@ export class SleepysBedController {
 
     let name = "Sleepy's Elite";
     try {
-      name = await device.getName();
+      name = await this.runBluetoothOperation(
+        () => device.getName(),
+        'Bluetooth device name lookup',
+      );
     } catch {
       // Keep default name.
     }
 
     this.log.debug(`Connecting to ${name}...`);
 
-    await device.connect();
+    await this.runBluetoothOperation(
+      () => device.connect(),
+      'Bluetooth device connection',
+      this.connectTimeoutMs,
+    );
 
-    const gatt = await device.gatt();
+    const gatt = await this.runBluetoothOperation(
+      () => device.gatt(),
+      'Bluetooth GATT initialization',
+    );
     this.gatt = gatt;
 
-    const service = await gatt.getPrimaryService(SERVICE_UUID);
-    const tx = await service.getCharacteristic(TX_UUID);
+    const service = await this.runBluetoothOperation(
+      () => gatt.getPrimaryService(SERVICE_UUID),
+      'Bluetooth service lookup',
+    );
+    const tx = await this.runBluetoothOperation(
+      () => service.getCharacteristic(TX_UUID),
+      'Bluetooth transmit characteristic lookup',
+    );
     this.tx = tx;
 
-    const rx = await service.getCharacteristic(RX_UUID);
+    const rx = await this.runBluetoothOperation(
+      () => service.getCharacteristic(RX_UUID),
+      'Bluetooth receive characteristic lookup',
+    );
     this.rx = rx;
 
     // Proven working sequence for BOX25:
     // connect -> wake with response -> subscribe to notifications.
-    await tx.writeValueWithResponse(WAKE);
+    await this.runBluetoothOperation(
+      () => tx.writeValueWithResponse(WAKE),
+      'Bluetooth wake command',
+    );
 
     rx.removeAllListeners?.('valuechanged');
     rx.on('valuechanged', (value) => {
       this.handleNotification(Buffer.from(value));
     });
 
-    await rx.startNotifications();
+    await this.runBluetoothOperation(
+      () => rx.startNotifications(),
+      'Bluetooth notification setup',
+    );
 
     this.connected = true;
+    this.reconnectFailures = 0;
 
     this.log.info("Sleepy's Elite Bluetooth connected.");
     this.drainMotorQueue();
   }
 
-  async cleanupConnection() {
+  async cleanupConnection({ forgetDevice = false } = {}) {
     if (this.cleanupPromise) {
       return this.cleanupPromise;
     }
@@ -276,6 +379,7 @@ export class SleepysBedController {
       const tx = this.tx;
       const device = this.device;
       const gatt = this.gatt;
+      const adapter = this.adapter;
 
       this.tx = null;
       this.rx = null;
@@ -284,7 +388,11 @@ export class SleepysBedController {
 
       if (rx) {
         try {
-          await rx.stopNotifications();
+          await this.runBluetoothOperation(
+            () => rx.stopNotifications(),
+            'Bluetooth notification cleanup',
+            this.cleanupTimeoutMs,
+          );
         } catch {
           // A stale GATT object cannot accept StopNotify. Listener cleanup below
           // must still run so old D-Bus PropertiesChanged handlers do not pile up.
@@ -306,12 +414,22 @@ export class SleepysBedController {
       this.removeGattListeners(gatt);
 
       if (device) {
+        let disconnectFailed = false;
+
         try {
-          await device.disconnect();
+          await this.runBluetoothOperation(
+            () => device.disconnect(),
+            'Bluetooth device disconnect',
+            this.cleanupTimeoutMs,
+          );
         } catch {
-          // BlueZ may already have removed the device object.
+          disconnectFailed = true;
         } finally {
           this.removeDeviceListeners(device);
+        }
+
+        if (forgetDevice || disconnectFailed) {
+          await this.forgetDevice(adapter, device);
         }
       }
 
@@ -334,6 +452,29 @@ export class SleepysBedController {
   removeDeviceListeners(device) {
     device?.removeAllListeners?.();
     device?.helper?.removeListeners?.();
+  }
+
+  deviceObjectPath(device) {
+    if (!device?.adapter || !device?.device) return null;
+    return `/org/bluez/${device.adapter}/${device.device}`;
+  }
+
+  async forgetDevice(adapter, device) {
+    const objectPath = this.deviceObjectPath(device);
+
+    if (!objectPath || !adapter?.helper?.callMethod) return false;
+
+    try {
+      await this.runBluetoothOperation(
+        () => adapter.helper.callMethod('RemoveDevice', objectPath),
+        'Bluetooth stale device removal',
+        this.cleanupTimeoutMs,
+      );
+      return true;
+    } catch (error) {
+      this.log.debug(`Failed to remove stale Bluetooth device: ${error.message}`);
+      return false;
+    }
   }
 
   removeGattListeners(gatt) {
@@ -361,7 +502,10 @@ export class SleepysBedController {
     return (
       missingGattObject.test(message) ||
       /org\.freedesktop\.DBus\.Error\.UnknownObject/i.test(message) ||
-      /org\.bluez\.Error\.NotConnected/i.test(message)
+      /org\.bluez\.Error\.NotConnected/i.test(message) ||
+      /le-connection-abort-by-local/i.test(message) ||
+      /ATT error:\s*0x0e/i.test(message) ||
+      /BLE_OPERATION_TIMEOUT|BluetoothOperationTimeoutError/i.test(message)
     );
   }
 
@@ -381,7 +525,7 @@ export class SleepysBedController {
         `Stale Bluetooth GATT connection detected (${error.message}); reconnecting now.`,
       );
 
-      await this.cleanupConnection();
+      await this.cleanupConnection({ forgetDevice: true });
       await this.ensureConnected();
     })();
 
@@ -426,7 +570,10 @@ export class SleepysBedController {
     }
 
     try {
-      await tx.writeValueWithoutResponse(frame);
+      await this.runBluetoothOperation(
+        () => tx.writeValueWithoutResponse(frame),
+        'Bluetooth command write',
+      );
     } catch (error) {
       if (this.stopping || !this.isStaleConnectionError(error)) {
         if (!this.stopping) {
@@ -452,7 +599,10 @@ export class SleepysBedController {
       }
 
       try {
-        await this.tx.writeValueWithoutResponse(frame);
+        await this.runBluetoothOperation(
+          () => this.tx.writeValueWithoutResponse(frame),
+          'Bluetooth command retry',
+        );
       } catch (retryError) {
         if (!this.stopping) {
           await this.cleanupConnection();
@@ -468,16 +618,28 @@ export class SleepysBedController {
       return;
     }
 
+    const delayMs = this.reconnectDelayMs();
+
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
 
       try {
         await this.ensureConnected();
       } catch (error) {
+        this.reconnectFailures += 1;
         this.log.debug(`Reconnect failed: ${error.message}`);
         this.scheduleReconnect();
       }
-    }, 1000);
+    }, delayMs);
+  }
+
+  reconnectDelayMs() {
+    const delayIndex = Math.min(
+      this.reconnectFailures,
+      this.reconnectDelaysMs.length - 1,
+    );
+
+    return this.reconnectDelaysMs[delayIndex];
   }
 
   buildMotorCommand(zone, value) {

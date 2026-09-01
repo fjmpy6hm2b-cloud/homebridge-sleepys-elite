@@ -29,6 +29,127 @@ test('recognizes stale BlueZ/GATT errors without retrying unrelated failures', (
     controller.isStaleConnectionError(new Error('temporary write timeout')),
     false,
   );
+  assert.equal(
+    controller.isStaleConnectionError(
+      new Error('le-connection-abort-by-local'),
+    ),
+    true,
+  );
+  assert.equal(
+    controller.isStaleConnectionError(
+      new Error('Operation failed with ATT error: 0x0e'),
+    ),
+    true,
+  );
+  assert.equal(
+    controller.isStaleConnectionError(
+      Object.assign(new Error('Bluetooth discovery start timed out'), {
+        name: 'BluetoothOperationTimeoutError',
+        code: 'BLE_OPERATION_TIMEOUT',
+      }),
+    ),
+    true,
+  );
+});
+
+test('times out a stuck BlueZ discovery call and recreates its session', async () => {
+  let destroyed = 0;
+  let adapterListenersRemoved = 0;
+
+  const adapter = {
+    async isDiscovering() {
+      return false;
+    },
+    async startDiscovery() {
+      return new Promise(() => {});
+    },
+    helper: {
+      removeListeners() {
+        adapterListenersRemoved += 1;
+      },
+    },
+  };
+
+  const controller = new SleepysBedController(log, {
+    operationTimeoutMs: 10,
+    cleanupTimeoutMs: 10,
+    createBluetooth() {
+      return {
+        bluetooth: {
+          async defaultAdapter() {
+            return adapter;
+          },
+        },
+        destroy() {
+          destroyed += 1;
+        },
+      };
+    },
+  });
+
+  await assert.rejects(
+    controller.ensureConnected(),
+    /Bluetooth discovery start timed out after 10ms/,
+  );
+
+  assert.equal(controller.connectPromise, null);
+  assert.equal(controller.bluetooth, null);
+  assert.equal(controller.adapter, null);
+  assert.equal(adapterListenersRemoved, 1);
+  assert.equal(destroyed, 1);
+});
+
+test('bounds a stuck disconnect and removes the stale BlueZ device', async () => {
+  const removeCalls = [];
+  let destroyed = 0;
+
+  const controller = new SleepysBedController(log, {
+    cleanupTimeoutMs: 10,
+  });
+
+  controller.bluetooth = {};
+  controller.adapter = {
+    helper: {
+      async callMethod(method, objectPath) {
+        removeCalls.push([method, objectPath]);
+      },
+      removeListeners() {},
+    },
+  };
+  controller.destroyBluetooth = () => {
+    destroyed += 1;
+  };
+  controller.device = {
+    adapter: 'hci0',
+    device: 'dev_CF_E5_D0_96_AF_C5',
+    async disconnect() {
+      return new Promise(() => {});
+    },
+    removeAllListeners() {},
+    helper: { removeListeners() {} },
+  };
+
+  await controller.cleanupConnection({ forgetDevice: true });
+
+  assert.deepEqual(removeCalls, [[
+    'RemoveDevice',
+    '/org/bluez/hci0/dev_CF_E5_D0_96_AF_C5',
+  ]]);
+  assert.equal(destroyed, 1);
+  assert.equal(controller.device, null);
+  assert.equal(controller.bluetooth, null);
+});
+
+test('uses bounded reconnect backoff and caps the delay', () => {
+  const controller = new SleepysBedController(log, {
+    reconnectDelaysMs: [1000, 2000, 5000],
+  });
+
+  assert.equal(controller.reconnectDelayMs(), 1000);
+  controller.reconnectFailures = 1;
+  assert.equal(controller.reconnectDelayMs(), 2000);
+  controller.reconnectFailures = 20;
+  assert.equal(controller.reconnectDelayMs(), 5000);
 });
 
 test('reconnects immediately, retries once, and cleans stale listeners', async () => {
@@ -121,6 +242,55 @@ test('reconnects immediately, retries once, and cleans stale listeners', async (
     deviceEvent: 1,
     deviceHelper: 1,
   });
+});
+
+test('times out a stuck command write, reconnects, and retries once', async () => {
+  const controller = new SleepysBedController(log, {
+    operationTimeoutMs: 10,
+  });
+  const frame = Buffer.from('5A0103103073A5', 'hex');
+  const oldTx = {
+    async writeValueWithoutResponse() {
+      return new Promise(() => {});
+    },
+    helper: { removeListeners() {} },
+  };
+
+  controller.connected = true;
+  controller.device = {
+    async isConnected() {
+      return true;
+    },
+    async disconnect() {},
+    removeAllListeners() {},
+    helper: { removeListeners() {} },
+  };
+  controller.tx = oldTx;
+  controller.rx = {
+    async stopNotifications() {},
+    removeAllListeners() {},
+    helper: { removeListeners() {} },
+  };
+
+  let reconnects = 0;
+  let retries = 0;
+  controller.connectOnce = async () => {
+    reconnects += 1;
+    controller.connected = true;
+    controller.device = { async isConnected() { return true; } };
+    controller.rx = {};
+    controller.tx = {
+      async writeValueWithoutResponse(retriedFrame) {
+        assert.deepEqual(retriedFrame, frame);
+        retries += 1;
+      },
+    };
+  };
+
+  await controller.writeFrame(frame);
+
+  assert.equal(reconnects, 1);
+  assert.equal(retries, 1);
 });
 
 test('reconnects before writing when BlueZ reports a cached link is disconnected', async () => {
