@@ -30,6 +30,7 @@
     "platform.js",
     "platformAccessory.js",
     "bedController.js",
+    "commandRecovery.js",
     "config.schema.json",
     "README.md",
     "CHANGELOG.md",
