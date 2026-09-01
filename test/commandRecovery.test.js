@@ -54,19 +54,29 @@ test('keeps the same command pending across reconnect attempts', async () => {
 });
 
 test('does not retry unrelated command failures', async () => {
-  const controller = new FakeController();
   const unrelatedError = new Error('permission denied');
 
-  controller.isStaleConnectionError = () => false;
-  controller.writeFrameNow = async () => {
-    throw unrelatedError;
-  };
+  class UnrelatedFailureController extends FakeController {
+    isStaleConnectionError() {
+      return false;
+    }
+
+    async writeFrameNow() {
+      this.attempts += 1;
+      throw unrelatedError;
+    }
+  }
+
+  installCommandRecovery(UnrelatedFailureController);
+
+  const controller = new UnrelatedFailureController();
 
   await assert.rejects(
     controller.writeFrameNow(Buffer.from([0x01])),
     /permission denied/,
   );
 
+  assert.equal(controller.attempts, 1);
   assert.equal(controller.cleanupCalls, 0);
 });
 
