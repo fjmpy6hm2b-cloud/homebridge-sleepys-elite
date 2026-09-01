@@ -3,7 +3,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export function installCommandRecovery(SleepysBedController) {
   const prototype = SleepysBedController.prototype;
 
-  if (prototype.__commandRecoveryInstalled) {
+  if (
+    Object.prototype.hasOwnProperty.call(
+      prototype,
+      '__commandRecoveryInstalled',
+    )
+  ) {
     return;
   }
 
