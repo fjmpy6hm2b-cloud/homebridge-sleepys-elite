@@ -152,6 +152,149 @@ test('uses bounded reconnect backoff and caps the delay', () => {
   assert.equal(controller.reconnectDelayMs(), 5000);
 });
 
+test('hourly health check leaves a healthy Bluetooth link alone', async () => {
+  const controller = new SleepysBedController(log);
+  let connectionChecks = 0;
+  let reconnects = 0;
+
+  controller.connected = true;
+  controller.device = {
+    async isConnected() {
+      connectionChecks += 1;
+      return true;
+    },
+  };
+  controller.tx = {};
+  controller.rx = {};
+  controller.connectOnce = async () => {
+    reconnects += 1;
+  };
+
+  await controller.checkConnectionHealth();
+
+  assert.equal(connectionChecks, 1);
+  assert.equal(reconnects, 0);
+  assert.equal(controller.connected, true);
+});
+
+test('hourly health check reconnects a disconnected Bluetooth link', async () => {
+  const controller = new SleepysBedController(log);
+  let connectionChecks = 0;
+  let reconnects = 0;
+
+  controller.connected = true;
+  controller.device = {
+    adapter: 'hci0',
+    device: 'dev_CF_E5_D0_96_AF_C5',
+    async isConnected() {
+      connectionChecks += 1;
+      return false;
+    },
+    async disconnect() {},
+    removeAllListeners() {},
+    helper: { removeListeners() {} },
+  };
+  controller.tx = { helper: { removeListeners() {} } };
+  controller.rx = {
+    async stopNotifications() {},
+    removeAllListeners() {},
+    helper: { removeListeners() {} },
+  };
+  controller.connectOnce = async () => {
+    reconnects += 1;
+    controller.connected = true;
+    controller.device = { async isConnected() { return true; } };
+    controller.tx = {};
+    controller.rx = {};
+  };
+
+  await controller.checkConnectionHealth();
+
+  assert.equal(connectionChecks, 1);
+  assert.equal(reconnects, 1);
+  assert.equal(controller.connected, true);
+});
+
+test('starts and stops the hourly Bluetooth health-check timer', async () => {
+  const controller = new SleepysBedController(log);
+  controller.ensureConnected = async () => {};
+
+  await controller.start();
+
+  assert.ok(controller.healthCheckTimer);
+
+  await controller.shutdown();
+
+  assert.equal(controller.healthCheckTimer, null);
+});
+
+test('carries a command through a recoverable connection failure', async () => {
+  const controller = new SleepysBedController(log);
+  const frame = Buffer.from('5A0103103074A5', 'hex');
+  const connectionError = new Error('le-connection-abort-by-local');
+  let connectionAttempts = 0;
+  let writes = 0;
+
+  controller.ensureConnected = async () => {
+    connectionAttempts += 1;
+
+    if (connectionAttempts === 1) {
+      throw connectionError;
+    }
+
+    controller.connected = true;
+    controller.device = { async isConnected() { return true; } };
+    controller.rx = {};
+    controller.tx = {
+      async writeValueWithoutResponse(retriedFrame) {
+        assert.deepEqual(retriedFrame, frame);
+        writes += 1;
+      },
+    };
+  };
+
+  await controller.writeFrame(frame);
+
+  assert.equal(connectionAttempts, 2);
+  assert.equal(writes, 1);
+});
+
+test('only attempts one immediate recovery for a failed command', async () => {
+  const controller = new SleepysBedController(log);
+  const connectionError = new Error('le-connection-abort-by-local');
+  let connectionAttempts = 0;
+
+  controller.ensureConnected = async () => {
+    connectionAttempts += 1;
+    throw connectionError;
+  };
+
+  await assert.rejects(
+    controller.writeFrame(Buffer.from('5A0103103074A5', 'hex')),
+    /le-connection-abort-by-local/,
+  );
+
+  assert.equal(connectionAttempts, 2);
+  assert.equal(controller.recoveryPromise, null);
+});
+
+test('does not immediately retry an unrelated connection failure', async () => {
+  const controller = new SleepysBedController(log);
+  let connectionAttempts = 0;
+
+  controller.ensureConnected = async () => {
+    connectionAttempts += 1;
+    throw new Error('bed unavailable');
+  };
+
+  await assert.rejects(
+    controller.writeFrame(Buffer.from('5A0103103074A5', 'hex')),
+    /bed unavailable/,
+  );
+
+  assert.equal(connectionAttempts, 1);
+});
+
 test('reconnects immediately, retries once, and cleans stale listeners', async () => {
   const controller = new SleepysBedController(log);
   const frame = Buffer.from('5A0103103073A5', 'hex');

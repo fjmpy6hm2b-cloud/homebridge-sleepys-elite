@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.5 — 2026-09-09
+
+- Ask BlueZ for the bed's connection status once per hour and reconnect only when the cached link is no longer healthy.
+- Keep the original HomeKit command through a recoverable connection/setup failure, reconnect immediately, and retry that command once.
+
 ## 1.2.4 — 2026-08-31
 
 - Add hard deadlines to BlueZ discovery, connection, GATT setup, command writes, and cleanup so a stalled D-Bus call cannot stop background recovery.

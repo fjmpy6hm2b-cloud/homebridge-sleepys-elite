@@ -37,6 +37,7 @@ export class SleepysBedController {
     this.connectTimeoutMs = options.connectTimeoutMs || 15000;
     this.cleanupTimeoutMs = options.cleanupTimeoutMs || 3000;
     this.discoveryTimeoutMs = options.discoveryTimeoutMs || 30000;
+    this.healthCheckIntervalMs = options.healthCheckIntervalMs ?? 60 * 60 * 1000;
     this.reconnectDelaysMs = options.reconnectDelaysMs || [
       1000,
       2000,
@@ -60,6 +61,7 @@ export class SleepysBedController {
     this.cleanupPromise = null;
     this.recoveryPromise = null;
     this.reconnectTimer = null;
+    this.healthCheckTimer = null;
     this.reconnectFailures = 0;
     this.writeQueue = Promise.resolve();
 
@@ -92,6 +94,8 @@ export class SleepysBedController {
         );
         this.scheduleReconnect();
       }
+    } finally {
+      this.scheduleHealthCheck();
     }
   }
 
@@ -553,23 +557,18 @@ export class SleepysBedController {
   }
 
   async writeFrameNow(frame) {
-    await this.ensureConnected();
-
-    const tx = this.tx;
-
-    if (!tx) {
-      const error = new Error(
-        'Bluetooth transmit characteristic is unavailable',
-      );
-
-      if (!this.stopping) {
-        await this.cleanupConnection();
-      }
-
-      throw error;
-    }
+    let tx = this.tx;
 
     try {
+      await this.ensureConnected();
+      tx = this.tx;
+
+      if (!tx) {
+        throw new Error(
+          'Bluetooth transmit characteristic is unavailable',
+        );
+      }
+
       await this.runBluetoothOperation(
         () => tx.writeValueWithoutResponse(frame),
         'Bluetooth command write',
@@ -585,7 +584,8 @@ export class SleepysBedController {
 
       await this.recoverStaleConnection(tx, error);
 
-      // Retry the original frame exactly once on the replacement GATT object.
+      // Retry the original frame exactly once whether the stale failure
+      // happened during connection setup or during the first write.
       if (!this.tx) {
         const retryError = new Error(
           'Bluetooth transmit characteristic is unavailable',
@@ -631,6 +631,50 @@ export class SleepysBedController {
         this.scheduleReconnect();
       }
     }, delayMs);
+  }
+
+  scheduleHealthCheck() {
+    if (
+      this.stopping ||
+      this.healthCheckTimer ||
+      this.healthCheckIntervalMs <= 0
+    ) {
+      return;
+    }
+
+    this.healthCheckTimer = setTimeout(async () => {
+      this.healthCheckTimer = null;
+
+      try {
+        await this.checkConnectionHealth();
+      } finally {
+        this.scheduleHealthCheck();
+      }
+    }, this.healthCheckIntervalMs);
+
+    this.healthCheckTimer.unref?.();
+  }
+
+  async checkConnectionHealth() {
+    if (
+      this.stopping ||
+      this.connectPromise ||
+      this.cleanupPromise ||
+      this.recoveryPromise
+    ) {
+      return;
+    }
+
+    try {
+      // This only asks BlueZ for the cached connection state. It does not send
+      // a command to the bed when the existing connection is healthy.
+      await this.ensureConnected();
+    } catch (error) {
+      if (!this.stopping) {
+        this.log.debug(`Bluetooth health check failed: ${error.message}`);
+        this.scheduleReconnect();
+      }
+    }
   }
 
   reconnectDelayMs() {
@@ -946,6 +990,11 @@ export class SleepysBedController {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+
+    if (this.healthCheckTimer) {
+      clearTimeout(this.healthCheckTimer);
+      this.healthCheckTimer = null;
     }
 
     if (this.motorTimeout) {
