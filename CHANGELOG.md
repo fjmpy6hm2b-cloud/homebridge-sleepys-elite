@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.6 — 2026-10-11
 
 - Reconnect and retry once for bed/device discovery failures as well as stale GATT failures.
 - Retain the latest requested lighting state for up to two minutes during background recovery; newer OFF requests cancel older brightness/RGB writes.
