@@ -664,3 +664,215 @@ test('queues a second motor zone and sends it after the first finishes', async (
 
   controller.releaseMotor('shutdown');
 });
+
+function simulateConnected(controller, writes) {
+  controller.connected = true;
+  controller.device = { async isConnected() { return true; }, async disconnect() {} };
+  controller.rx = { async stopNotifications() {} };
+  controller.tx = {
+    async writeValueWithoutResponse(frame) { writes.push(frame.toString('hex')); },
+  };
+}
+
+for (const message of ["Sleepy's Elite not found", 'Device not found']) {
+  test(`retries the original command once after ${message}`, async () => {
+    const controller = new SleepysBedController(log);
+    const writes = [];
+    let attempts = 0;
+    controller.ensureConnected = async () => {
+      if (++attempts === 1) throw new Error(message);
+      simulateConnected(controller, writes);
+    };
+    await controller.setLightPower(false);
+    assert.equal(attempts, 2);
+    assert.deepEqual(writes, ['5a0103103074a5']);
+    assert.equal(controller.pendingLightCommands.size, 0);
+  });
+}
+
+function simulateUnavailable(controller) {
+  controller.ensureConnected = async () => { throw new Error("Sleepy's Elite not found"); };
+  controller.scheduleReconnect = () => {};
+}
+
+test('replays a failed light OFF after background reconnection', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.setLightPower(false), /not found/);
+  assert.equal(controller.pendingLightCommands.size, 1);
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5a0103103074a5']);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('background reconnect automatically flushes retained lighting', async () => {
+  const controller = new SleepysBedController(log, { reconnectDelaysMs: [1] });
+  controller.ensureConnected = async () => { throw new Error('Device not found'); };
+  await assert.rejects(controller.setLightPower(false), /not found/);
+  let transmitted;
+  const sent = new Promise((resolve) => { transmitted = resolve; });
+  controller.ensureConnected = async () => {
+    controller.connected = true;
+    controller.tx = { async writeValueWithoutResponse(frame) { transmitted(frame.toString('hex')); } };
+  };
+  assert.equal(await sent, '5a0103103074a5');
+  await controller.writeQueue;
+  await controller.shutdown();
+});
+
+test('retains power, brightness and color in order when ON fails', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  const requests = await Promise.allSettled([
+    controller.setLightPower(true),
+    controller.set('led', 33),
+    controller.setColor(255, 68, 0),
+  ]);
+  assert.ok(requests.every((result) => result.status === 'rejected'));
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5a0103103073a5', '5ae00400020000a5', '5ae00402ff4400a5']);
+});
+
+test('newer OFF cancels retained color and brightness that could turn LEDs on', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.setColor(255, 0, 0), /not found/);
+  await assert.rejects(controller.set('led', 67), /not found/);
+  await assert.rejects(controller.setLightPower(false), /not found/);
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5a0103103074a5']);
+});
+
+test('only the latest retained brightness is replayed', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.set('led', 17), /not found/);
+  await assert.rejects(controller.set('led', 83), /not found/);
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5ae00400050000a5']);
+});
+
+test('OFF supersedes a color request waiting for Bluetooth without writing it', async () => {
+  const controller = new SleepysBedController(log);
+  const writes = [];
+  let releaseConnection;
+  const connection = new Promise((resolve) => { releaseConnection = resolve; });
+  controller.ensureConnected = async () => {
+    await connection;
+    simulateConnected(controller, writes);
+  };
+  const color = controller.setColor(255, 0, 0);
+  await nextTurn();
+  const off = controller.setLightPower(false);
+  releaseConnection();
+  assert.deepEqual(await color, { sent: false, reason: 'superseded' });
+  await off;
+  assert.deepEqual(writes, ['5a0103103074a5']);
+});
+
+test('lighting expires instead of replaying after a long outage', async (t) => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const controller = new SleepysBedController(log, { lightRecoveryWindowMs: 100 });
+  simulateUnavailable(controller);
+  await assert.rejects(controller.setLightPower(false), /not found/);
+  now = 1100;
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, []);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('a motor request that expires during reconnection never reaches the bed', async (t) => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const controller = new SleepysBedController(log, { motorRequestWindowMs: 100 });
+  const writes = [];
+  controller.ensureConnected = async () => {
+    now = 1100;
+    simulateConnected(controller, writes);
+  };
+  await assert.rejects(controller.set('head', 40), /expired before transmission/);
+  assert.deepEqual(writes, []);
+  assert.equal(controller.connected, true);
+  assert.equal(controller.motorBusy, false);
+  assert.equal(controller.motorTimeout, null);
+  assert.equal(controller.reconnectTimer, null);
+});
+
+test('queued motor requests retain their original expiry', async (t) => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const controller = new SleepysBedController(log, { motorRequestWindowMs: 100 });
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.set('head', 25);
+  await controller.set('feet', 40);
+  now = 2100;
+  controller.releaseMotor('target');
+  await nextTurn();
+  assert.equal(writes.length, 1);
+  assert.equal(controller.pendingMotorCommands.size, 0);
+  assert.equal(controller.motorBusy, false);
+});
+
+test('motor movement timer starts after transmission, not during discovery', async () => {
+  const controller = new SleepysBedController(log);
+  const writes = [];
+  let releaseConnection;
+  const connection = new Promise((resolve) => { releaseConnection = resolve; });
+  controller.ensureConnected = async () => {
+    await connection;
+    simulateConnected(controller, writes);
+  };
+  const moving = controller.set('head', 25);
+  await nextTurn();
+  assert.equal(controller.motorBusy, true);
+  assert.equal(controller.motorTimeout, null);
+  controller.handleNotification(Buffer.from([0xa5, 0x0d, 0, 0, 25, 0, 0, 0, 0]));
+  assert.equal(controller.motorBusy, true);
+  releaseConnection();
+  await moving;
+  assert.ok(controller.motorTimeout);
+  controller.releaseMotor('shutdown');
+});
+
+test('shutdown discards retained lighting and prevents replay', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.setLightPower(true), /not found/);
+  await controller.shutdown();
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, []);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('an expired motor write failure still starts background connection recovery', async (t) => {
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const controller = new SleepysBedController(log, { motorRequestWindowMs: 100 });
+  let backgroundRecoveries = 0;
+  controller.scheduleReconnect = () => { backgroundRecoveries += 1; };
+  controller.ensureConnected = async () => {
+    controller.connected = true;
+    controller.tx = {
+      async writeValueWithoutResponse() { now = 1100; throw staleError; },
+    };
+  };
+  await assert.rejects(controller.set('feet', 40), /expired before transmission/);
+  assert.ok(backgroundRecoveries > 0);
+  assert.equal(controller.connected, false);
+  assert.equal(controller.motorBusy, false);
+  assert.equal(controller.pendingMotorCommands.size, 0);
+});

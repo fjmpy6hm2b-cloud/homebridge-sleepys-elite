@@ -149,3 +149,65 @@ test('physical light power updates preserve the last nonzero brightness', () => 
     67,
   );
 });
+
+test('registers brightness and color even when the ON request fails', async () => {
+  const { controller, lightService } = createLightAccessory();
+  const calls = [];
+  controller.bed = {
+    async setLightPower() { calls.push('power'); throw new Error('Device not found'); },
+    async set() { calls.push('brightness'); },
+    async setColor() { calls.push('color'); },
+  };
+  await lightService.getCharacteristic(Characteristic.On).setter(true);
+  assert.deepEqual(calls, ['power', 'brightness', 'color']);
+});
+
+test('an older ON completion cannot overwrite a newer OFF state', async () => {
+  const { controller, lightService } = createLightAccessory();
+  let finishOn;
+  const pending = new Promise((resolve) => { finishOn = resolve; });
+  controller.bed = {
+    async setLightPower(on) { if (on) await pending; return { sent: true }; },
+    async set() { return { sent: true }; },
+    async setColor() { return { sent: true }; },
+  };
+  const oldOn = lightService.getCharacteristic(Characteristic.On).setter(true);
+  await lightService.getCharacteristic(Characteristic.On).setter(false);
+  finishOn();
+  await oldOn;
+  assert.equal(controller.lightOn, false);
+  assert.equal(controller.values.led, 0);
+});
+
+test('optional bed debug logging uses the normal log without enabling global debug', () => {
+  const { controller } = createLightAccessory();
+  const messages = [];
+  controller.config = { debugBluetooth: true };
+  controller.log.info = (...args) => messages.push(args);
+  controller.bluetoothLogger().debug('scanning');
+  assert.deepEqual(messages, [['[Bluetooth debug]', 'scanning']]);
+});
+
+test('OFF cancels a pending color debounce even if Bluetooth cannot send OFF', async () => {
+  const { controller, lightService } = createLightAccessory();
+  controller.lightOn = true;
+  controller.colorDebounceTimer = setTimeout(() => assert.fail('old color timer ran'), 10000);
+  controller.bed = {
+    async setLightPower() { throw new Error('Device not found'); },
+  };
+  await lightService.getCharacteristic(Characteristic.On).setter(false);
+  assert.equal(controller.colorDebounceTimer, null);
+  assert.equal(controller.requestedLightPower, false);
+});
+
+test('color changes remain stored while a failed OFF request is pending', async () => {
+  const { controller } = createLightAccessory();
+  controller.lightOn = true;
+  controller.requestedLightPower = false;
+  controller.colorDebounceMs = 1;
+  let writes = 0;
+  controller.bed = { async setColor() { writes += 1; } };
+  controller.scheduleColorSet();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(writes, 0);
+});

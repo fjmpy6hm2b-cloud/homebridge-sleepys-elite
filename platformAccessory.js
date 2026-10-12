@@ -24,6 +24,8 @@ export class SleepysElitePlatformAccessory {
     };
 
     this.lightOn = false;
+    this.requestedLightPower = null;
+    this.lightPowerRequestId = 0;
     const storedLightBrightness = Number(
       this.accessory.context.lastLightBrightness,
     );
@@ -70,7 +72,7 @@ export class SleepysElitePlatformAccessory {
       const { SleepysBedController } = await import('./bedController.js');
 
       this.bed = new SleepysBedController(
-        this.log,
+        this.bluetoothLogger(),
         this.controllerOptions(),
       );
 
@@ -86,6 +88,20 @@ export class SleepysElitePlatformAccessory {
       onPosition: (position) => this.updatePosition(position),
       onLightState: (on) => this.updateLightState(on),
       onColorState: (rgb) => this.updateColorState(rgb),
+    };
+  }
+
+  bluetoothLogger() {
+    return {
+      debug: (...messages) => {
+        if (this.config?.debugBluetooth) {
+          this.log.info('[Bluetooth debug]', ...messages);
+        } else {
+          this.log.debug(...messages);
+        }
+      },
+      info: (...messages) => this.log.info(...messages),
+      warn: (...messages) => this.log.warn(...messages),
     };
   }
 
@@ -161,6 +177,13 @@ export class SleepysElitePlatformAccessory {
 
         if (zone === 'led') {
           this.cancelDebounce(zone);
+          const requestId = (this.lightPowerRequestId || 0) + 1;
+          this.lightPowerRequestId = requestId;
+          this.requestedLightPower = on;
+          if (!on && this.colorDebounceTimer) {
+            clearTimeout(this.colorDebounceTimer);
+            this.colorDebounceTimer = null;
+          }
 
           if (!this.bed) {
             this.log.debug(
@@ -172,7 +195,8 @@ export class SleepysElitePlatformAccessory {
           try {
             if (!on) {
               this.rememberLightBrightness(this.values.led);
-              await this.bed.setLightPower(false);
+              const result = await this.bed.setLightPower(false);
+              if (requestId !== this.lightPowerRequestId || result?.sent === false) return;
               this.lightOn = false;
               this.values.led = 0;
 
@@ -180,26 +204,27 @@ export class SleepysElitePlatformAccessory {
                 .getCharacteristic(this.Characteristic.Brightness)
                 .updateValue(0);
             } else {
-              await this.bed.setLightPower(true);
-              this.lightOn = true;
-              this.values.led = this.lastLightBrightness;
-
-              this.services.led
-                .getCharacteristic(this.Characteristic.Brightness)
-                .updateValue(this.values.led);
-
-              // Restore the last hardware brightness after BOX25's dedicated
-              // ON command, which otherwise returns to its own default level.
-              await this.bed.set('led', this.values.led);
-
-              // BOX25's dedicated ON command resets the LEDs to white,
-              // so restore the HomeKit-selected RGB color immediately.
+              const brightness = this.lastLightBrightness;
               const { red, green, blue } = this.hsvToRgb(
                 this.color.hue,
                 this.color.saturation,
               );
 
-              await this.bed.setColor(red, green, blue);
+              // Register the whole requested light state before awaiting BLE.
+              // The controller serializes the frames and can retain all three
+              // through an outage, including brightness/color after ON fails.
+              const results = await Promise.all([
+                this.bed.setLightPower(true),
+                this.bed.set('led', brightness),
+                this.bed.setColor(red, green, blue),
+              ]);
+              if (requestId !== this.lightPowerRequestId ||
+                results.some((result) => result?.sent === false)) return;
+              this.lightOn = true;
+              this.values.led = brightness;
+              this.services.led
+                .getCharacteristic(this.Characteristic.Brightness)
+                .updateValue(brightness);
             }
           } catch (error) {
             this.log.warn(
@@ -239,6 +264,7 @@ export class SleepysElitePlatformAccessory {
 
           this.values.led = position;
           this.lightOn = position > 0;
+          this.requestedLightPower = position > 0;
 
           // Report the actual BOX25 brightness step back to HomeKit so
           // the slider settles on 17/33/50/67/83/100 instead of showing
@@ -307,7 +333,7 @@ export class SleepysElitePlatformAccessory {
 
       // Remember HomeKit color changes while the light is off, but do not
       // transmit them because a direct RGB command also illuminates the LEDs.
-      if (!this.lightOn) {
+      if (!(this.requestedLightPower ?? this.lightOn)) {
         this.log.debug('Stored light color while light is off.');
         return;
       }
@@ -527,6 +553,9 @@ export class SleepysElitePlatformAccessory {
 
   updateLightState(on) {
     this.lightOn = Boolean(on);
+    if (!this.bed?.pendingLightCommands?.size) {
+      this.requestedLightPower = this.lightOn;
+    }
 
     if (!this.lightOn) {
       this.rememberLightBrightness(this.values.led);
