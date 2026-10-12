@@ -14,6 +14,8 @@ Unofficial Homebridge dynamic-platform plugin for Sleepy's Elite / BOX25 adjusta
 - Physical-remote position, light-power, and RGB color updates reflected in HomeKit
 - Debounced slider commands
 - Queued motor requests with one motor movement at a time
+- Latest lighting requests retained for up to two minutes during Bluetooth recovery; OFF cancels older brightness/color requests
+- Motor requests expire after 15 seconds if they have not been transmitted, including queued requests
 - Native Node.js Bluetooth over BlueZ/D-Bus
 - No Python, virtual environment, or Bleak setup
 
@@ -35,6 +37,9 @@ No Python setup is required.
 
 - **Name:** HomeKit accessory name.
 - **Bed Bluetooth Name Prefix:** defaults to `Star25`.
+- **Bluetooth Debug Logging:** defaults to off. Enable it and restart the child bridge to show scan durations, connection/setup failures, reconnect delays, and lighting replay in the normal Homebridge log. This does not send diagnostic commands to the bed.
+
+Discovery failures (`Sleepy's Elite not found` / `Device not found`) receive one immediate reconnect-and-retry, like stale GATT failures. If lighting still fails, the latest power, brightness, and color requests can be replayed after background recovery within two minutes of the original request. Later requests replace older requests; turning the light off also cancels older commands that could turn it back on. Requests are discarded at shutdown. Motor requests are never retained for delayed background replay beyond their 15-second transmission window.
 
 ## Current status
 

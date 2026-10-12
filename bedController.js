@@ -38,6 +38,8 @@ export class SleepysBedController {
     this.cleanupTimeoutMs = options.cleanupTimeoutMs || 3000;
     this.discoveryTimeoutMs = options.discoveryTimeoutMs || 30000;
     this.healthCheckIntervalMs = options.healthCheckIntervalMs ?? 60 * 60 * 1000;
+    this.lightRecoveryWindowMs = options.lightRecoveryWindowMs ?? 120000;
+    this.motorRequestWindowMs = options.motorRequestWindowMs ?? 15000;
     this.reconnectDelaysMs = options.reconnectDelaysMs || [
       1000,
       2000,
@@ -64,6 +66,9 @@ export class SleepysBedController {
     this.healthCheckTimer = null;
     this.reconnectFailures = 0;
     this.writeQueue = Promise.resolve();
+    this.pendingLightCommands = new Map();
+    this.lightRequestSequence = 0;
+    this.lightFlushPromise = null;
 
     this.positions = {
       head: null,
@@ -72,6 +77,7 @@ export class SleepysBedController {
     };
 
     this.motorBusy = false;
+    this.motorCommandSent = false;
     this.motorZone = null;
     this.motorTarget = null;
     this.motorStartedAt = 0;
@@ -116,8 +122,14 @@ export class SleepysBedController {
     }
   }
 
-  runBluetoothOperation(operation, label, timeoutMs = this.operationTimeoutMs) {
-    return this.withTimeout(operation, timeoutMs, label);
+  async runBluetoothOperation(operation, label, timeoutMs = this.operationTimeoutMs) {
+    const started = Date.now();
+    try {
+      return await this.withTimeout(operation, timeoutMs, label);
+    } catch (error) {
+      this.log.debug(`${label} failed after ${Date.now() - started}ms: ${error.message}`);
+      throw error;
+    }
   }
 
   async ensureBluetooth() {
@@ -257,6 +269,8 @@ export class SleepysBedController {
     );
 
     const deadline = Date.now() + this.discoveryTimeoutMs;
+    const scanStarted = Date.now();
+    let deviceCount = 0;
 
     try {
       while (!this.stopping && Date.now() < deadline) {
@@ -264,6 +278,7 @@ export class SleepysBedController {
           () => adapter.devices(),
           'Bluetooth device listing',
         );
+        deviceCount = ids.length;
 
         for (const id of ids) {
           const device = await this.runBluetoothOperation(
@@ -282,6 +297,7 @@ export class SleepysBedController {
           }
 
           if (name.startsWith(this.deviceNamePrefix)) {
+            this.log.debug(`Found bed ${name} after ${Date.now() - scanStarted}ms.`);
             return device;
           }
 
@@ -300,6 +316,7 @@ export class SleepysBedController {
       }
     }
 
+    this.log.debug(`Bed discovery ended after ${Date.now() - scanStarted}ms; ${deviceCount} device records visible, no matching bed.`);
     throw new Error("Sleepy's Elite not found");
   }
 
@@ -507,6 +524,7 @@ export class SleepysBedController {
       missingGattObject.test(message) ||
       /org\.freedesktop\.DBus\.Error\.UnknownObject/i.test(message) ||
       /org\.bluez\.Error\.NotConnected/i.test(message) ||
+      /(?:^|\s)(?:Sleepy's Elite|Device) not found$/i.test(message) ||
       /le-connection-abort-by-local/i.test(message) ||
       /ATT error:\s*0x0e/i.test(message) ||
       /BLE_OPERATION_TIMEOUT|BluetoothOperationTimeoutError/i.test(message)
@@ -544,10 +562,10 @@ export class SleepysBedController {
     }
   }
 
-  writeFrame(frame) {
+  writeFrame(frame, beforeWrite = () => {}) {
     const queuedFrame = Buffer.from(frame);
     const operation = this.writeQueue.then(() =>
-      this.writeFrameNow(queuedFrame),
+      this.writeFrameNow(queuedFrame, beforeWrite),
     );
 
     // Keep the queue usable after a failed command while returning the original
@@ -556,11 +574,13 @@ export class SleepysBedController {
     return operation;
   }
 
-  async writeFrameNow(frame) {
+  async writeFrameNow(frame, beforeWrite = () => {}) {
     let tx = this.tx;
 
     try {
+      beforeWrite();
       await this.ensureConnected();
+      beforeWrite();
       tx = this.tx;
 
       if (!tx) {
@@ -574,6 +594,9 @@ export class SleepysBedController {
         'Bluetooth command write',
       );
     } catch (error) {
+      if (error.code === 'COMMAND_EXPIRED' || error.code === 'COMMAND_SUPERSEDED') {
+        throw error;
+      }
       if (this.stopping || !this.isStaleConnectionError(error)) {
         if (!this.stopping) {
           await this.cleanupConnection();
@@ -582,7 +605,19 @@ export class SleepysBedController {
         throw error;
       }
 
+      try {
+        beforeWrite();
+      } catch (validationError) {
+        // The original failure was a stale BLE link. Even when its command
+        // has expired, restore connectivity without replaying the command.
+        if (!this.stopping) {
+          await this.cleanupConnection({ forgetDevice: true });
+          this.scheduleReconnect();
+        }
+        throw validationError;
+      }
       await this.recoverStaleConnection(tx, error);
+      beforeWrite();
 
       // Retry the original frame exactly once whether the stale failure
       // happened during connection setup or during the first write.
@@ -619,12 +654,14 @@ export class SleepysBedController {
     }
 
     const delayMs = this.reconnectDelayMs();
+    this.log.debug(`Scheduling Bluetooth reconnect in ${delayMs}ms (failures: ${this.reconnectFailures}, pending light commands: ${this.pendingLightCommands.size}).`);
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
 
       try {
         await this.ensureConnected();
+        await this.flushPendingLightCommands();
       } catch (error) {
         this.reconnectFailures += 1;
         this.log.debug(`Reconnect failed: ${error.message}`);
@@ -669,6 +706,7 @@ export class SleepysBedController {
       // This only asks BlueZ for the cached connection state. It does not send
       // a command to the bed when the existing connection is healthy.
       await this.ensureConnected();
+      await this.flushPendingLightCommands();
     } catch (error) {
       if (!this.stopping) {
         this.log.debug(`Bluetooth health check failed: ${error.message}`);
@@ -684,6 +722,94 @@ export class SleepysBedController {
     );
 
     return this.reconnectDelaysMs[delayIndex];
+  }
+
+  assertCommandFresh(expiresAt, description) {
+    if (this.stopping) throw new Error('Controller is stopping');
+    if (Date.now() >= expiresAt) {
+      const error = new Error(`${description} expired before transmission`);
+      error.code = 'COMMAND_EXPIRED';
+      this.log.debug(error.message);
+      throw error;
+    }
+  }
+
+  runLightCommand(kind, frame, description, options = {}) {
+    // OFF also cancels older brightness/RGB commands, which can illuminate
+    // the LEDs. A later ON/brightness/color request can supersede it normally.
+    if (kind === 'power' && options.on === false) {
+      this.pendingLightCommands.clear();
+    }
+
+    const request = {
+      kind,
+      frame: Buffer.from(frame),
+      description,
+      sequence: ++this.lightRequestSequence,
+      expiresAt: Date.now() + this.lightRecoveryWindowMs,
+      inFlight: false,
+    };
+    this.pendingLightCommands.set(kind, request);
+    return this.sendPendingLightCommand(request);
+  }
+
+  async sendPendingLightCommand(request) {
+    request.inFlight = true;
+    try {
+      await this.writeFrame(request.frame, () => {
+        this.assertCommandFresh(request.expiresAt, `Light ${request.description}`);
+        if (this.pendingLightCommands.get(request.kind) !== request) {
+          const error = new Error('Light command superseded by a newer request');
+          error.code = 'COMMAND_SUPERSEDED';
+          throw error;
+        }
+      });
+      if (this.pendingLightCommands.get(request.kind) === request) {
+        this.pendingLightCommands.delete(request.kind);
+      }
+      this.log.info(`Sent ${request.description}`);
+      return { sent: true };
+    } catch (error) {
+      const current = this.pendingLightCommands.get(request.kind) === request;
+      if (current && !this.stopping && this.isStaleConnectionError(error) &&
+        Date.now() < request.expiresAt) {
+        this.log.debug(`Retaining light ${request.description} for recovery (${request.expiresAt - Date.now()}ms remaining): ${error.message}`);
+        this.scheduleReconnect();
+      } else if (current) {
+        this.pendingLightCommands.delete(request.kind);
+      }
+      if (error.code === 'COMMAND_SUPERSEDED') {
+        return { sent: false, reason: 'superseded' };
+      }
+      throw error;
+    } finally {
+      request.inFlight = false;
+    }
+  }
+
+  async flushPendingLightCommands() {
+    if (this.stopping || this.lightFlushPromise) return this.lightFlushPromise;
+    const flush = (async () => {
+      const requests = [...this.pendingLightCommands.values()]
+        .sort((a, b) => a.sequence - b.sequence);
+      for (const request of requests) {
+        if (this.stopping) return;
+        if (request.inFlight || this.pendingLightCommands.get(request.kind) !== request) continue;
+        try {
+          this.log.debug(`Replaying retained light ${request.description}.`);
+          await this.sendPendingLightCommand(request);
+        } catch (error) {
+          this.log.debug(`Retained light ${request.description} recovery failed: ${error.message}`);
+          if (!this.connected) break;
+        }
+      }
+    })();
+    this.lightFlushPromise = flush;
+    try {
+      await flush;
+    } finally {
+      if (this.lightFlushPromise === flush) this.lightFlushPromise = null;
+    }
   }
 
   buildMotorCommand(zone, value) {
@@ -715,23 +841,9 @@ export class SleepysBedController {
   }
 
   async setColor(red, green, blue) {
-    try {
-      const frame = this.buildColorCommand(red, green, blue);
-
-      await this.writeFrame(frame);
-
-      this.log.info(
-        `Sent color RGB(${frame[4]}, ${frame[5]}, ${frame[6]})`,
-      );
-
-      return { sent: true };
-    } catch (error) {
-      if (!this.stopping) {
-        this.scheduleReconnect();
-      }
-
-      throw error;
-    }
+    const frame = this.buildColorCommand(red, green, blue);
+    return this.runLightCommand('color', frame,
+      `color RGB(${frame[4]}, ${frame[5]}, ${frame[6]})`);
   }
 
   buildBrightnessCommand(value) {
@@ -753,24 +865,10 @@ export class SleepysBedController {
   }
 
   async setLightPower(on) {
-    try {
-      const frame = Buffer.from(
-        on ? '5A0103103073A5' : '5A0103103074A5',
-        'hex',
-      );
-
-      await this.writeFrame(frame);
-
-      this.log.info(`Sent led ${on ? 'on' : 'off'}`);
-
-      return { sent: true };
-    } catch (error) {
-      if (!this.stopping) {
-        this.scheduleReconnect();
-      }
-
-      throw error;
-    }
+    const frame = Buffer.from(
+      on ? '5A0103103073A5' : '5A0103103074A5', 'hex',
+    );
+    return this.runLightCommand('power', frame, `led ${on ? 'on' : 'off'}`, { on: Boolean(on) });
   }
 
   motorTimeoutFor(zone, target) {
@@ -784,7 +882,7 @@ export class SleepysBedController {
     return Math.max(4000, Math.min(15000, 4000 + distance * 120));
   }
 
-  async set(zone, rawValue) {
+  async set(zone, rawValue, options = {}) {
     const value = Math.max(0, Math.min(100, Math.round(Number(rawValue))));
 
     try {
@@ -795,22 +893,22 @@ export class SleepysBedController {
 
         const frame = this.buildBrightnessCommand(value);
 
-        await this.writeFrame(frame);
-
-        this.log.info(`Sent led ${value}%`);
-        return { sent: true };
+        return this.runLightCommand('brightness', frame, `led ${value}%`);
       }
 
       if (!(zone in ZONES)) {
         throw new Error(`Unknown bed zone: ${zone}`);
       }
 
+      const expiresAt = options.expiresAt ?? Date.now() + this.motorRequestWindowMs;
+      this.assertCommandFresh(expiresAt, `Motor ${zone} ${value}%`);
+
       if (this.motorBusy) {
         this.log.debug(
           `Queued ${zone} ${value}% while ${this.motorZone} is moving to ${this.motorTarget}%.`,
         );
 
-        this.pendingMotorCommands.set(zone, value);
+        this.pendingMotorCommands.set(zone, { value, expiresAt });
 
         return {
           sent: false,
@@ -820,6 +918,7 @@ export class SleepysBedController {
       }
 
       this.motorBusy = true;
+      this.motorCommandSent = false;
       this.motorZone = zone;
       this.motorTarget = value;
       this.motorStartedAt = Date.now();
@@ -830,12 +929,18 @@ export class SleepysBedController {
         clearTimeout(this.motorTimeout);
       }
 
-      this.motorTimeout = setTimeout(() => {
-        this.releaseMotor('timeout');
-      }, timeoutMs);
-
       try {
-        await this.writeFrame(this.buildMotorCommand(zone, value));
+        await this.writeFrame(this.buildMotorCommand(zone, value), () => {
+          this.assertCommandFresh(expiresAt, `Motor ${zone} ${value}%`);
+        });
+
+        // A slow reconnection must not release the motor lock before the
+        // motor command has actually been transmitted.
+        this.motorStartedAt = Date.now();
+        this.motorCommandSent = true;
+        this.motorTimeout = setTimeout(() => {
+          this.releaseMotor('timeout');
+        }, timeoutMs);
 
         this.log.info(`Sent ${zone} ${value}%`);
 
@@ -845,7 +950,8 @@ export class SleepysBedController {
         throw error;
       }
     } catch (error) {
-      if (!this.stopping) {
+      if (!this.stopping &&
+        (error.code !== 'COMMAND_EXPIRED' || !this.connected)) {
         this.scheduleReconnect();
       }
 
@@ -888,11 +994,12 @@ export class SleepysBedController {
     );
 
     this.motorBusy = false;
+    this.motorCommandSent = false;
     this.motorZone = null;
     this.motorTarget = null;
     this.motorStartedAt = 0;
 
-    if (reason !== 'write-error' && reason !== 'shutdown') {
+    if (reason !== 'shutdown') {
       this.drainMotorQueue();
     }
   }
@@ -916,15 +1023,15 @@ export class SleepysBedController {
         const next = this.pendingMotorCommands.entries().next().value;
         if (!next) return;
 
-        const [zone, value] = next;
+        const [zone, request] = next;
         this.pendingMotorCommands.delete(zone);
 
         try {
-          await this.set(zone, value);
+          await this.set(zone, request.value, { expiresAt: request.expiresAt });
         } catch (error) {
           if (!this.stopping) {
             this.log.warn(
-              `Failed to send queued ${zone} ${value}%: ${error.message}`,
+              `Failed to send queued ${zone} ${request.value}%: ${error.message}`,
             );
           }
         }
@@ -951,6 +1058,7 @@ export class SleepysBedController {
 
       if (
         this.motorBusy &&
+        this.motorCommandSent &&
         this.motorZone &&
         Math.abs(position[this.motorZone] - this.motorTarget) <= 1
       ) {
@@ -1008,6 +1116,7 @@ export class SleepysBedController {
     }
 
     this.pendingMotorCommands.clear();
+    this.pendingLightCommands.clear();
     this.releaseMotor('shutdown');
 
     const pendingWork = [this.connectPromise, this.writeQueue]

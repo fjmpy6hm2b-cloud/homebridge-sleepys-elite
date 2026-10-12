@@ -15,6 +15,12 @@
         "type": "string",
         "default": "Star25",
         "description": "Bluetooth advertising-name prefix used to discover the bed."
+      },
+      "debugBluetooth": {
+        "title": "Bluetooth Debug Logging",
+        "type": "boolean",
+        "default": false,
+        "description": "Show bed discovery, connection failures, retries, and retained lighting requests in the normal Homebridge log."
       }
     },
     "required": [
@@ -24,6 +30,7 @@
   },
   "form": [
     "name",
-    "deviceNamePrefix"
+    "deviceNamePrefix",
+    "debugBluetooth"
   ]
 }

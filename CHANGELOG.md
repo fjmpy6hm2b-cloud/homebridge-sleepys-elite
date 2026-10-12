@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.6 — 2026-10-11
+
+- Reconnect and retry once for bed/device discovery failures as well as stale GATT failures.
+- Retain the latest requested lighting state for up to two minutes during background recovery; newer OFF requests cancel older brightness/RGB writes.
+- Expire untransmitted motor requests after 15 seconds, and start the movement timeout only after transmission.
+- Add optional Bluetooth debug logging for discovery, timed operations, reconnect backoff, and lighting replay.
+
 ## 1.2.5 — 2026-09-09
 
 - Ask BlueZ for the bed's connection status once per hour and reconnect only when the cached link is no longer healthy.
