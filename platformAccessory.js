@@ -40,8 +40,11 @@ export class SleepysElitePlatformAccessory {
     this.services = {};
     this.motorDebounceMs = 700;
     this.lightDebounceMs = 700;
-    this.colorDebounceMs = 250;
-    this.colorDebounceTimer = null;
+    this.lightUpdateTimer = null;
+    this.pendingLightUpdate = null;
+    this.lightUpdateInFlight = 0;
+    this.lightOffPromise = null;
+    this.shuttingDown = false;
     this.debounceTimers = {};
     this.pendingValues = {};
     this.lastSent = {};
@@ -151,7 +154,7 @@ export class SleepysElitePlatformAccessory {
             0,
             Math.min(360, Number(value)),
           );
-          this.scheduleColorSet();
+          this.requestLightColor({ hue: this.color.hue });
         });
 
       service
@@ -162,7 +165,7 @@ export class SleepysElitePlatformAccessory {
             0,
             Math.min(100, Number(value)),
           );
-          this.scheduleColorSet();
+          this.requestLightColor({ saturation: this.color.saturation });
         });
     }
 
@@ -176,56 +179,8 @@ export class SleepysElitePlatformAccessory {
         const on = Boolean(value);
 
         if (zone === 'led') {
-          this.cancelDebounce(zone);
-          const requestId = (this.lightPowerRequestId || 0) + 1;
-          this.lightPowerRequestId = requestId;
-          this.requestedLightPower = on;
-          if (!on && this.colorDebounceTimer) {
-            clearTimeout(this.colorDebounceTimer);
-            this.colorDebounceTimer = null;
-          }
-
-          if (!this.bed) {
-            this.log.debug(
-              `Ignored light ${on ? 'on' : 'off'} because Bluetooth is unavailable.`,
-            );
-            return;
-          }
-
-          try {
-            if (!on) {
-              this.rememberLightBrightness(this.values.led);
-              const result = await this.bed.setLightPower(false);
-              if (requestId !== this.lightPowerRequestId || result?.sent === false) return;
-              this.lightOn = false;
-              this.values.led = 0;
-
-              this.services.led
-                .getCharacteristic(this.Characteristic.Brightness)
-                .updateValue(0);
-            } else {
-              const brightness = this.lastLightBrightness;
-              const { red, green, blue } = this.hsvToRgb(
-                this.color.hue,
-                this.color.saturation,
-              );
-
-              const result = await this.bed.turnLightOn(
-                red, green, blue, brightness,
-              );
-              if (requestId !== this.lightPowerRequestId || result?.sent === false) return;
-              this.lightOn = true;
-              this.values.led = brightness;
-              this.services.led
-                .getCharacteristic(this.Characteristic.Brightness)
-                .updateValue(brightness);
-            }
-          } catch (error) {
-            this.log.warn(
-              `Failed to turn light ${on ? 'on' : 'off'}: ${error.message}`,
-            );
-          }
-
+          if (on) this.queueLightUpdate({ turnOn: true });
+          else await this.requestLightOff();
           return;
         }
 
@@ -257,8 +212,6 @@ export class SleepysElitePlatformAccessory {
           }
 
           this.values.led = position;
-          this.lightOn = position > 0;
-          this.requestedLightPower = position > 0;
 
           // Report the actual BOX25 brightness step back to HomeKit so
           // the slider settles on 17/33/50/67/83/100 instead of showing
@@ -269,7 +222,8 @@ export class SleepysElitePlatformAccessory {
               .updateValue(position);
           }
 
-          this.scheduleSet(zone, position, this.lightDebounceMs);
+          if (position === 0) await this.requestLightOff();
+          else this.queueLightUpdate({ brightness: position });
         } else {
           this.values[zone] = position;
           this.scheduleSet(zone, position, this.motorDebounceMs);
@@ -310,39 +264,136 @@ export class SleepysElitePlatformAccessory {
     return Math.round(level * 100 / 6);
   }
 
-  scheduleColorSet() {
-    if (this.colorDebounceTimer) {
-      clearTimeout(this.colorDebounceTimer);
+  requestLightColor(color) {
+    // Direct RGB also illuminates the LEDs. Keep color edits local while off.
+    if (!(this.requestedLightPower ?? this.lightOn)) {
+      this.log.debug('Stored light color while light is off.');
+      return;
+    }
+    this.queueLightUpdate(color);
+  }
+
+  cancelLightUpdate() {
+    if (this.lightUpdateTimer) clearTimeout(this.lightUpdateTimer);
+    this.lightUpdateTimer = null;
+    this.pendingLightUpdate = null;
+  }
+
+  queueLightUpdate(changes) {
+    if (this.shuttingDown) return;
+    const wasOn = this.requestedLightPower ?? this.lightOn;
+    const target = this.pendingLightUpdate || {
+      brightness: this.lastLightBrightness,
+      hue: this.color.hue,
+      saturation: this.color.saturation,
+      turnOn: false,
+      colorChanged: false,
+      brightnessChanged: false,
+    };
+    target.turnOn ||= Boolean(changes.turnOn) || !wasOn;
+    if (changes.brightness !== undefined) {
+      target.brightness = changes.brightness;
+      target.brightnessChanged = true;
+    }
+    for (const key of ['hue', 'saturation']) {
+      if (changes[key] !== undefined) {
+        target[key] = changes[key];
+        target.colorChanged = true;
+      }
+    }
+    target.requestId = ++this.lightPowerRequestId;
+    this.requestedLightPower = true;
+    // An intervening ON/color/brightness request invalidates OFF deduplication.
+    if (this.lastSent.led === 0) delete this.lastSent.led;
+    this.pendingLightUpdate = target;
+    if (this.lightUpdateTimer) clearTimeout(this.lightUpdateTimer);
+    this.lightUpdateTimer = setTimeout(() => this.flushLightUpdate(), this.lightDebounceMs);
+  }
+
+  async flushLightUpdate() {
+    if (this.lightUpdateTimer) clearTimeout(this.lightUpdateTimer);
+    this.lightUpdateTimer = null;
+    const target = this.pendingLightUpdate;
+    this.pendingLightUpdate = null;
+    if (!target || this.shuttingDown || this.requestedLightPower === false) return;
+    if (!this.bed) {
+      this.log.debug('Ignored light update because Bluetooth is unavailable.');
+      return;
     }
 
-    this.colorDebounceTimer = setTimeout(async () => {
-      this.colorDebounceTimer = null;
-
-      if (!this.bed) {
-        this.log.debug(
-          'Ignored color change because Bluetooth is unavailable.',
-        );
-        return;
+    const { red, green, blue } = this.hsvToRgb(target.hue, target.saturation);
+    this.lightUpdateInFlight += 1;
+    try {
+      const writes = [];
+      let brightnessWritten = target.turnOn;
+      if (target.turnOn) {
+        writes.push(this.bed.turnLightOn(red, green, blue, target.brightness));
+      } else {
+        if (target.colorChanged) writes.push(this.bed.setColor(red, green, blue));
+        if (target.brightnessChanged && !(
+          this.lastSent.led === target.brightness &&
+          Date.now() - (this.lastSentAt.led || 0) < this.duplicateWindowMs
+        )) {
+          writes.push(this.bed.set('led', target.brightness));
+          brightnessWritten = true;
+        }
       }
+      const results = await Promise.all(writes);
+      if (target.requestId !== this.lightPowerRequestId ||
+        results.some((result) => result?.sent === false)) return;
 
-      // Remember HomeKit color changes while the light is off, but do not
-      // transmit them because a direct RGB command also illuminates the LEDs.
-      if (!(this.requestedLightPower ?? this.lightOn)) {
-        this.log.debug('Stored light color while light is off.');
-        return;
+      this.lightOn = true;
+      this.values.led = target.brightness;
+      this.rememberLightBrightness(target.brightness);
+      if (brightnessWritten) {
+        this.lastSent.led = target.brightness;
+        this.lastSentAt.led = Date.now();
       }
+      this.services.led.getCharacteristic(this.Characteristic.On).updateValue(true);
+      this.services.led.getCharacteristic(this.Characteristic.Brightness).updateValue(target.brightness);
+    } catch (error) {
+      this.log.warn(`Failed to update light: ${error.message}`);
+    } finally {
+      this.lightUpdateInFlight -= 1;
+    }
+  }
 
-      const { red, green, blue } = this.hsvToRgb(
-        this.color.hue,
-        this.color.saturation,
-      );
+  async requestLightOff() {
+    if (this.shuttingDown) return;
+    this.cancelLightUpdate();
+    this.cancelDebounce('led');
+    const alreadyRequested = this.requestedLightPower === false;
+    this.requestedLightPower = false;
+    this.rememberLightBrightness(this.values.led);
+    if (alreadyRequested && this.lightOffPromise) return this.lightOffPromise;
+    if (alreadyRequested && this.lastSent.led === 0 &&
+      Date.now() - (this.lastSentAt.led || 0) < this.duplicateWindowMs) return;
 
+    const requestId = ++this.lightPowerRequestId;
+    if (!this.bed) {
+      this.log.debug('Ignored light off because Bluetooth is unavailable.');
+      return;
+    }
+    const operation = (async () => {
       try {
-        await this.bed.setColor(red, green, blue);
+        const result = await this.bed.setLightPower(false);
+        if (requestId !== this.lightPowerRequestId || result?.sent === false) return;
+        this.lightOn = false;
+        this.values.led = 0;
+        this.lastSent.led = 0;
+        this.lastSentAt.led = Date.now();
+        this.services.led.getCharacteristic(this.Characteristic.On).updateValue(false);
+        this.services.led.getCharacteristic(this.Characteristic.Brightness).updateValue(0);
       } catch (error) {
-        this.log.warn(`Failed to set light color: ${error.message}`);
+        this.log.warn(`Failed to turn light off: ${error.message}`);
       }
-    }, this.colorDebounceMs);
+    })();
+    this.lightOffPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.lightOffPromise === operation) this.lightOffPromise = null;
+    }
   }
 
   hsvToRgb(hue, saturation) {
@@ -547,7 +598,9 @@ export class SleepysElitePlatformAccessory {
 
   updateLightState(on) {
     this.lightOn = Boolean(on);
-    if (!this.bed?.pendingLightCommands?.size) {
+    if (this.lightOn && this.lastSent.led === 0) delete this.lastSent.led;
+    if (!this.pendingLightUpdate && !this.lightUpdateInFlight &&
+      !this.lightOffPromise && !this.bed?.pendingLightCommands?.size) {
       this.requestedLightPower = this.lightOn;
     }
 
@@ -568,13 +621,11 @@ export class SleepysElitePlatformAccessory {
   }
 
   async shutdown() {
+    this.shuttingDown = true;
+    this.lightPowerRequestId += 1;
+    this.cancelLightUpdate();
     for (const timer of Object.values(this.debounceTimers)) {
       clearTimeout(timer);
-    }
-
-    if (this.colorDebounceTimer) {
-      clearTimeout(this.colorDebounceTimer);
-      this.colorDebounceTimer = null;
     }
 
     if (this.bed) {
