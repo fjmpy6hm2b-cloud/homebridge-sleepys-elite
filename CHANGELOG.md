@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.8 — 2026-10-14
+
+- Combine related HomeKit power, color, and brightness updates over a 700 ms window so an explicit brightness replaces the remembered startup brightness.
+- Share the OFF command between power-off and brightness-zero requests, suppressing duplicate successful OFF writes within two seconds.
+- Keep color-first startup and Bluetooth recovery; OFF immediately cancels pending lighting updates.
+
 ## 1.2.7 — 2026-10-14
 
 - Turn on the under-bed light directly in its selected RGB color, then restore brightness, avoiding the separate ON command that resets the LEDs to white.
