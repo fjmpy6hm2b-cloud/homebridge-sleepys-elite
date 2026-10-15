@@ -737,6 +737,79 @@ test('retains power, brightness and color in order when ON fails', async () => {
   assert.deepEqual(writes, ['5a0103103073a5', '5ae00400020000a5', '5ae00402ff4400a5']);
 });
 
+test('turns on with RGB before brightness without a white-resetting ON frame', async () => {
+  const controller = new SleepysBedController(log);
+  const writes = [];
+  simulateConnected(controller, writes);
+  assert.deepEqual(await controller.turnLightOn(0, 255, 0, 33), { sent: true });
+  assert.deepEqual(writes, ['5ae0040200ff00a5', '5ae00400020000a5']);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('retains both color-first startup requests through a Bluetooth outage', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.turnLightOn(255, 68, 0, 33), /not found/);
+  await controller.writeQueue;
+  assert.deepEqual([...controller.pendingLightCommands.keys()], ['color', 'brightness']);
+
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5ae00402ff4400a5', '5ae00400020000a5']);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('color-first startup replaces a retained OFF instead of replaying it later', async () => {
+  const controller = new SleepysBedController(log);
+  simulateUnavailable(controller);
+  await assert.rejects(controller.setLightPower(false), /not found/);
+  await assert.rejects(controller.turnLightOn(0, 255, 0, 33), /not found/);
+  await controller.writeQueue;
+
+  const writes = [];
+  controller.ensureConnected = async () => simulateConnected(controller, writes);
+  await controller.flushPendingLightCommands();
+  assert.deepEqual(writes, ['5ae0040200ff00a5', '5ae00400020000a5']);
+  assert.equal(controller.pendingLightCommands.size, 0);
+});
+
+test('color-first startup cancels an older OFF waiting for a connection', async () => {
+  const controller = new SleepysBedController(log);
+  const writes = [];
+  let releaseConnection;
+  const connection = new Promise((resolve) => { releaseConnection = resolve; });
+  controller.ensureConnected = async () => {
+    await connection;
+    simulateConnected(controller, writes);
+  };
+  const off = controller.setLightPower(false);
+  await nextTurn();
+  const on = controller.turnLightOn(0, 255, 0, 33);
+  releaseConnection();
+  assert.deepEqual(await off, { sent: false, reason: 'superseded' });
+  assert.deepEqual(await on, { sent: true });
+  assert.deepEqual(writes, ['5ae0040200ff00a5', '5ae00400020000a5']);
+});
+
+test('newer OFF cancels both startup frames while waiting for a connection', async () => {
+  const controller = new SleepysBedController(log);
+  const writes = [];
+  let releaseConnection;
+  const connection = new Promise((resolve) => { releaseConnection = resolve; });
+  controller.ensureConnected = async () => {
+    await connection;
+    simulateConnected(controller, writes);
+  };
+  const on = controller.turnLightOn(0, 255, 0, 33);
+  await nextTurn();
+  const off = controller.setLightPower(false);
+  releaseConnection();
+  assert.deepEqual(await on, { sent: false });
+  await off;
+  assert.deepEqual(writes, ['5a0103103074a5']);
+});
+
 test('newer OFF cancels retained color and brightness that could turn LEDs on', async () => {
   const controller = new SleepysBedController(log);
   simulateUnavailable(controller);

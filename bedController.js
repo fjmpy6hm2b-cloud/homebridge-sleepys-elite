@@ -871,6 +871,21 @@ export class SleepysBedController {
     return this.runLightCommand('power', frame, `led ${on ? 'on' : 'off'}`, { on: Boolean(on) });
   }
 
+  async turnLightOn(red, green, blue, brightness) {
+    // Direct RGB illuminates the LEDs in the requested color. The dedicated
+    // ON frame resets them to white, so omit it and restore brightness second.
+    // Supersede an older OFF even if it is still queued or awaiting recovery.
+    this.pendingLightCommands.delete('power');
+
+    // Register both requests before awaiting BLE so each survives an outage.
+    // writeQueue preserves color-before-brightness order on the wire.
+    const results = await Promise.all([
+      this.setColor(red, green, blue),
+      this.set('led', brightness),
+    ]);
+    return { sent: results.every((result) => result?.sent !== false) };
+  }
+
   motorTimeoutFor(zone, target) {
     const current = this.positions[zone];
 
