@@ -210,16 +210,10 @@ export class SleepysElitePlatformAccessory {
                 this.color.saturation,
               );
 
-              // Register the whole requested light state before awaiting BLE.
-              // The controller serializes the frames and can retain all three
-              // through an outage, including brightness/color after ON fails.
-              const results = await Promise.all([
-                this.bed.setLightPower(true),
-                this.bed.set('led', brightness),
-                this.bed.setColor(red, green, blue),
-              ]);
-              if (requestId !== this.lightPowerRequestId ||
-                results.some((result) => result?.sent === false)) return;
+              const result = await this.bed.turnLightOn(
+                red, green, blue, brightness,
+              );
+              if (requestId !== this.lightPowerRequestId || result?.sent === false) return;
               this.lightOn = true;
               this.values.led = brightness;
               this.services.led

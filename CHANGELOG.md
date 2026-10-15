@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.7 — 2026-10-14
+
+- Turn on the under-bed light directly in its selected RGB color, then restore brightness, avoiding the separate ON command that resets the LEDs to white.
+- Preserve lighting recovery and cancel older retained OFF requests when turning the light back on.
+
 ## 1.2.6 — 2026-10-11
 
 - Reconnect and retry once for bed/device discovery failures as well as stale GATT failures.

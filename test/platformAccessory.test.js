@@ -100,20 +100,15 @@ test('wires physical position, power, and color callbacks', () => {
   });
 });
 
-test('restores brightness and color when the under-bed light is turned on', async () => {
+test('turns on directly in the selected color and restores brightness', async () => {
   const { controller, lightService } = createLightAccessory();
   const calls = [];
+  controller.color = { hue: 120, saturation: 100 };
 
   controller.bed = {
-    async setLightPower(on) {
-      calls.push(['power', on]);
-    },
-    async set(zone, value) {
-      calls.push(['set', zone, value]);
+    async turnLightOn(red, green, blue, brightness) {
+      calls.push([red, green, blue, brightness]);
       return { sent: true };
-    },
-    async setColor(red, green, blue) {
-      calls.push(['color', red, green, blue]);
     },
   };
 
@@ -125,11 +120,7 @@ test('restores brightness and color when the under-bed light is turned on', asyn
     lightService.getCharacteristic(Characteristic.Brightness).value,
     33,
   );
-  assert.deepEqual(calls, [
-    ['power', true],
-    ['set', 'led', 33],
-    ['color', 255, 255, 255],
-  ]);
+  assert.deepEqual(calls, [[0, 255, 0, 33]]);
 });
 
 test('physical light power updates preserve the last nonzero brightness', () => {
@@ -150,16 +141,14 @@ test('physical light power updates preserve the last nonzero brightness', () => 
   );
 });
 
-test('registers brightness and color even when the ON request fails', async () => {
+test('does not report the light on when color-first startup fails', async () => {
   const { controller, lightService } = createLightAccessory();
-  const calls = [];
   controller.bed = {
-    async setLightPower() { calls.push('power'); throw new Error('Device not found'); },
-    async set() { calls.push('brightness'); },
-    async setColor() { calls.push('color'); },
+    async turnLightOn() { throw new Error('Device not found'); },
   };
   await lightService.getCharacteristic(Characteristic.On).setter(true);
-  assert.deepEqual(calls, ['power', 'brightness', 'color']);
+  assert.equal(controller.lightOn, false);
+  assert.equal(controller.values.led, 0);
 });
 
 test('an older ON completion cannot overwrite a newer OFF state', async () => {
@@ -167,9 +156,8 @@ test('an older ON completion cannot overwrite a newer OFF state', async () => {
   let finishOn;
   const pending = new Promise((resolve) => { finishOn = resolve; });
   controller.bed = {
-    async setLightPower(on) { if (on) await pending; return { sent: true }; },
-    async set() { return { sent: true }; },
-    async setColor() { return { sent: true }; },
+    async setLightPower() { return { sent: true }; },
+    async turnLightOn() { await pending; return { sent: true }; },
   };
   const oldOn = lightService.getCharacteristic(Characteristic.On).setter(true);
   await lightService.getCharacteristic(Characteristic.On).setter(false);
